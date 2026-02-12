@@ -1,5 +1,15 @@
 import { useMemo, useState } from "react";
 import { classifyPromptToTemplate, getPublicTemplates, getTemplateById } from "../lib/templates";
+import Button from "../components/ui/Button";
+import Card, { CardBody } from "../components/ui/Card";
+import Input from "../components/ui/Input";
+import Toast from "../components/ui/Toast";
+import AuthBar from "../components/landing/AuthBar";
+import HeroSection from "../components/landing/HeroSection";
+import TemplateGallery from "../components/landing/TemplateGallery";
+import LandingSelectors from "../components/landing/LandingSelectors";
+import ProjectList from "../components/landing/ProjectList";
+
 import "./landing.css";
 
 const TEMPLATE_ID_KEY = "aigb_selected_template_id";
@@ -11,6 +21,36 @@ const SUGGESTIONS = [
   "A Ludo-style board game with turn-based moves",
   "A physics platform with ramps and bouncing balls",
 ];
+
+const MODULE_TAGS = {
+  "runtime.physics3d.runner": "Runner",
+  "runtime.physics3d.driving": "Driving",
+  "runtime.physics3d.shooter.simple": "Shooter",
+  "runtime.physics3d.platformer": "Platformer",
+  "runtime.board2d.ludo": "Ludo",
+  "runtime.board2d.snake": "Snake",
+};
+
+function toRelativeTime(value) {
+  const ts = Number(value);
+  if (!Number.isFinite(ts)) return "Updated recently";
+  const delta = Math.max(0, Date.now() - ts);
+  const mins = Math.floor(delta / 60000);
+  if (mins < 1) return "Updated just now";
+  if (mins < 60) return `Updated ${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `Updated ${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `Updated ${days}d ago`;
+}
+
+function getTemplateTags(template) {
+  const raw = Array.isArray(template?.requiredModules) ? template.requiredModules : [];
+  const tags = raw
+    .filter((mod) => !mod.endsWith(".base"))
+    .map((mod) => MODULE_TAGS[mod] || "Extra features");
+  return Array.from(new Set(tags)).slice(0, 3);
+}
 
 export default function Landing({
   user,
@@ -42,6 +82,8 @@ export default function Landing({
   const [showSignIn, setShowSignIn] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   const [lastTemplateHint, setLastTemplateHint] = useState("");
+  const [toastMessage, setToastMessage] = useState("");
+  const [buildPulse, setBuildPulse] = useState(false);
 
   const recentProjects = useMemo(() => projects.slice(0, 10), [projects]);
   const templates = useMemo(() => getPublicTemplates(), []);
@@ -76,27 +118,27 @@ export default function Landing({
     localStorage.setItem(TEMPLATE_ID_KEY, template.id);
     localStorage.setItem(TEMPLATE_MODE_KEY, template.mode);
     localStorage.setItem(TEMPLATE_MODULES_KEY, JSON.stringify(template.requiredModules || []));
+    setToastMessage(`Template selected: ${template.name}`);
+    setBuildPulse(true);
+    setTimeout(() => setBuildPulse(false), 950);
   };
 
   const handleNext = (autoRun = true) => {
     if (!prompt.trim()) return;
 
-    const selection = classifyPromptToTemplate({
-      prompt,
-      forceMode: activeTemplate?.mode || modePreference,
-      preferredTemplateId: selectedTemplateId,
-    });
-
-    const chosenTemplate = getTemplateById(selection.templateId) || activeTemplate;
-    const effectiveForceMode = chosenTemplate?.mode || selection.intent || modePreference;
-    const requiredModules = chosenTemplate?.requiredModules || selection.modulesEnabled || [];
+    const hasExplicitTemplate = Boolean(selectedTemplateId);
+    const chosenTemplate = hasExplicitTemplate ? getTemplateById(selectedTemplateId) : null;
+    const effectiveForceMode = chosenTemplate?.mode || selectedMode || modePreference || "auto";
+    const requiredModules = hasExplicitTemplate
+      ? (selectedModules.length > 0 ? selectedModules : chosenTemplate?.requiredModules || [])
+      : [];
 
     onCreateProject?.({
       name: prompt.trim().slice(0, 42) || "Untitled",
       prompt: prompt.trim(),
       provider,
       forceMode: effectiveForceMode,
-      templateId: selection.templateId,
+      templateId: hasExplicitTemplate ? selectedTemplateId : "",
       requiredModules,
       autoRun,
     });
@@ -123,226 +165,83 @@ export default function Landing({
     setAuthMessage("Signed in locally.");
   };
 
-  return (
+    return (
     <div className="landing-shell">
       <div className="landing-core">
-        <div className="auth-bar">
-          {user?.isGuest ? (
-            <>
-              <p>Mode: <strong>Guest</strong></p>
-              <button type="button" onClick={() => onContinueAsGuest?.()}>
-                Continue as Guest
-              </button>
-              <button type="button" onClick={() => setShowSignIn((v) => !v)}>
-                Sign in
-              </button>
-            </>
-          ) : (
-            <>
-              <p>
-                Signed in as <strong>{user?.name || user?.email}</strong>
-              </p>
-              <button type="button" onClick={() => onContinueAsGuest?.()}>
-                Switch to Guest
-              </button>
-            </>
-          )}
-        </div>
+        <AuthBar
+          user={user}
+          showSignIn={showSignIn}
+          authMessage={authMessage}
+          nameInput={nameInput}
+          emailInput={emailInput}
+          setNameInput={setNameInput}
+          setEmailInput={setEmailInput}
+          onContinueAsGuest={onContinueAsGuest}
+          onSignInToggle={() => setShowSignIn((v) => !v)}
+          onSignInSubmit={handleSignInSubmit}
+        />
 
-        {showSignIn ? (
-          <div className="auth-bar">
-            <input
-              type="text"
-              value={nameInput}
-              onChange={(event) => setNameInput(event.target.value)}
-              placeholder="Name"
-              aria-label="Name"
-            />
-            <input
-              type="email"
-              value={emailInput}
-              onChange={(event) => setEmailInput(event.target.value)}
-              placeholder="Email"
-              aria-label="Email"
-            />
-            <button type="button" onClick={handleSignInSubmit}>
-              Save Sign-in
-            </button>
-          </div>
-        ) : null}
+        <HeroSection
+          prompt={prompt}
+          setPrompt={setPrompt}
+          buildPulse={buildPulse}
+          onBuild={() => handleNext(true)}
+          suggestions={SUGGESTIONS}
+        />
 
-        {authMessage ? <p className="auth-message">{authMessage}</p> : null}
+        <TemplateGallery
+          templates={templates}
+          activeTemplate={activeTemplate}
+          selectedTemplateId={selectedTemplateId || suggestedSelection.templateId}
+          suggestedSelection={suggestedSelection}
+          selectedMode={selectedMode}
+          onSelectTemplate={selectTemplate}
+        />
 
-        <p className="landing-kicker">Jigrify · AI Game Builder from India</p>
-        <h1>What do you want to build?</h1>
-
-        <div className="landing-input-wrap">
-          <input
-            type="text"
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            placeholder="Describe your game idea..."
-            aria-label="Build prompt"
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                handleNext();
-              }
-            }}
-          />
-          <button type="button" onClick={() => handleNext(true)}>
-            Next
-          </button>
-        </div>
-
-        <div className="landing-suggestions">
-          {SUGGESTIONS.map((suggestion) => (
-            <button key={suggestion} type="button" onClick={() => setPrompt(suggestion)}>
-              {suggestion}
-            </button>
-          ))}
-        </div>
-
-        <section className="templates-gallery">
-          <div className="templates-gallery-head">
-            <h2>Templates Gallery</h2>
-            <p>
-              Suggested: <strong>{activeTemplate?.name || "Auto"}</strong>
-            </p>
-            <p>
-              Selected: <strong>{activeTemplate?.name || "None"}</strong>
-              {activeTemplate?.mode || selectedMode ? ` (${activeTemplate?.mode || selectedMode})` : ""}
-            </p>
-          </div>
-          <div className="templates-grid">
-            {templates.map((template) => {
-              const isActive = (selectedTemplateId || suggestedSelection.templateId) === template.id;
-              return (
-                <button
-                  key={template.id}
-                  type="button"
-                  role="button"
-                  tabIndex={0}
-                  className={`template-card templateCard ${isActive ? "active templateCardSelected" : ""}`}
-                  onClick={() => selectTemplate(template)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      selectTemplate(template);
-                    }
-                  }}
-                >
-                  {isActive ? <span className="template-selected-badge">Selected</span> : null}
-                  <h3>{template.name}</h3>
-                  <p>{template.mode}</p>
-                  <p>Modules: {template.requiredModules.join(", ")}</p>
-                </button>
-              );
-            })}
-          </div>
-          {suggestedSelection.limitationSummary ? (
-            <p className="template-note">Capability note: {suggestedSelection.limitationSummary}</p>
-          ) : null}
-        </section>
-
-        <div className="landing-selectors">
-          <div className="selector-item">
-            <label htmlFor="framework-select">🧩 Framework</label>
-            <select
-              id="framework-select"
-              value={activeTemplate?.mode || modePreference}
-              onChange={(event) => {
-                setModePreference(event.target.value);
-                setSelectedMode(event.target.value);
-              }}
-            >
-              <option value="auto">Auto</option>
-              <option value="physics3d">3D Physics</option>
-              <option value="board2d">Board Game</option>
-            </select>
-          </div>
-
-          <div className="selector-item">
-            <label htmlFor="provider-select">🤖 Provider</label>
-            <select
-              id="provider-select"
-              value={provider}
-              onChange={(event) => setProvider(event.target.value)}
-            >
-              <option value="openai">OpenAI</option>
-              <option value="gemini">Gemini</option>
-            </select>
-          </div>
-
-          {modePreference !== "board2d" ? (
-            <div className="selector-item toggle-item">
-              <label htmlFor="physics-toggle">⚙️ Physics</label>
-              <label className="switch" htmlFor="physics-toggle">
-                <input
-                  id="physics-toggle"
-                  type="checkbox"
-                  checked={physicsEnabled}
-                  onChange={(event) => setPhysicsEnabled(event.target.checked)}
-                />
-                <span>{physicsEnabled ? "On" : "Off"}</span>
-              </label>
-            </div>
-          ) : null}
-        </div>
+        <LandingSelectors
+          modePreference={modePreference}
+          setModePreference={setModePreference}
+          setSelectedMode={setSelectedMode}
+          activeTemplate={activeTemplate}
+          provider={provider}
+          setProvider={setProvider}
+          physicsEnabled={physicsEnabled}
+          setPhysicsEnabled={setPhysicsEnabled}
+        />
 
         <div className="landing-bottom-actions">
-          <button
-            type="button"
-            className="open-builder-btn"
+          <Button
+            variant="secondary"
             onClick={() =>
               onCreateProject?.({
                 name: "Untitled",
                 provider,
                 forceMode: activeTemplate?.mode || modePreference,
-                templateId: selectedTemplateId || suggestedSelection.templateId,
-                requiredModules:
-                  selectedModules.length > 0
-                    ? selectedModules
-                    : activeTemplate?.requiredModules || suggestedSelection.modulesEnabled || [],
+                templateId: selectedTemplateId || "",
+                requiredModules: selectedTemplateId
+                  ? (selectedModules.length > 0 ? selectedModules : activeTemplate?.requiredModules || [])
+                  : [],
                 autoRun: false,
               })
             }
           >
             New Project
-          </button>
-          <button type="button" className="open-builder-btn" onClick={handleOpenActive}>
-            Open Existing Builder
-          </button>
+          </Button>
+          {activeProjectId ? (
+            <Button variant="ghost" onClick={handleOpenActive}>
+              Continue last project
+            </Button>
+          ) : null}
         </div>
 
-        <div className="panel-card history-box" style={{ marginTop: 16 }}>
-          <h3>Projects</h3>
-          {recentProjects.length === 0 ? (
-            <p>No projects yet.</p>
-          ) : (
-            <ul>
-              {recentProjects.map((project) => (
-                <li key={project.id}>
-                  <strong>{project.name || "Untitled"}</strong>
-                  <span>{new Date(project.updatedAt).toLocaleString()}</span>
-                  <button type="button" onClick={() => onOpenProject?.(project.id)}>
-                    Open
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (window.confirm(`Delete project \"${project.name || "Untitled"}\"?`)) {
-                        onDeleteProject?.(project.id);
-                      }
-                    }}
-                  >
-                    Delete
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+        <ProjectList
+          recentProjects={recentProjects}
+          onOpenProject={onOpenProject}
+          onDeleteProject={onDeleteProject}
+        />
       </div>
+
+      <Toast open={Boolean(toastMessage)} message={toastMessage} onDone={() => setToastMessage("")} />
     </div>
   );
 }

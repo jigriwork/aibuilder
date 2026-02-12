@@ -5,6 +5,7 @@ import {
   createProject,
   deleteProject,
   getActiveProjectId,
+  getProjectById,
   getProjectsForUser,
   getStoredUser,
   setActiveProjectId,
@@ -40,14 +41,41 @@ function migrateLegacyStorageKeys() {
   }
 }
 
+function parseRoute(pathname) {
+  const cleanPath = typeof pathname === "string" ? pathname : "/";
+  const match = cleanPath.match(/^\/p\/([^/]+)$/);
+  if (match) {
+    return {
+      name: "builder",
+      projectId: decodeURIComponent(match[1]),
+    };
+  }
+  return { name: "landing", projectId: "" };
+}
+
+function pathForRoute(routeName, projectId = "") {
+  if (routeName === "builder" && projectId) {
+    return `/p/${encodeURIComponent(projectId)}`;
+  }
+  return "/";
+}
+
+function createRunId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export default function App() {
   migrateLegacyStorageKeys();
 
+  const initialRoute = parseRoute(window.location.pathname);
   const [currentUser, setCurrentUser] = useState(() => getStoredUser());
-  const [route, setRoute] = useState("landing");
-  const [activeProjectId, setActiveProjectIdState] = useState(() => getActiveProjectId(getStoredUser().id));
+  const [routeState, setRouteState] = useState(initialRoute);
   const [buildRequest, setBuildRequest] = useState(null);
   const [projectsVersion, setProjectsVersion] = useState(0);
+  const [lastProjectId, setLastProjectId] = useState(() => getActiveProjectId(getStoredUser().id));
 
   const projects = useMemo(
     () => getProjectsForUser(currentUser.id),
@@ -55,28 +83,44 @@ export default function App() {
   );
 
   useEffect(() => {
-    const nextActive = getActiveProjectId(currentUser.id);
-    setActiveProjectIdState(nextActive);
+    setLastProjectId(getActiveProjectId(currentUser.id));
   }, [currentUser.id, projectsVersion]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setRouteState(parseRoute(window.location.pathname));
+    };
+
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser.id]);
 
   const refreshProjects = () => setProjectsVersion((v) => v + 1);
 
-  const setActiveProject = (projectId) => {
-    setActiveProjectId(currentUser.id, projectId);
-    setActiveProjectIdState(projectId);
-    refreshProjects();
+  const navigateTo = (routeName, projectId = "") => {
+    const nextPath = pathForRoute(routeName, projectId);
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, "", nextPath);
+    }
+    setRouteState({ name: routeName, projectId: projectId || "" });
+  };
+
+  const setLastProject = (projectId) => {
+    setActiveProjectId(currentUser.id, projectId || "");
+    setLastProjectId(projectId || "");
   };
 
   const handleContinueAsGuest = () => {
     const guest = setStoredUser({});
     setCurrentUser(guest);
-    setRoute("landing");
+    navigateTo("landing");
   };
 
   const handleSignIn = ({ name, email }) => {
     const nextUser = setStoredUser({ name, email });
     setCurrentUser(nextUser);
-    setRoute("landing");
+    navigateTo("landing");
   };
 
   const handleCreateProject = ({
@@ -88,52 +132,84 @@ export default function App() {
     requiredModules,
     autoRun = false,
   }) => {
+    const normalizedPrompt = String(prompt || "").trim();
+    const normalizedModules = Array.isArray(requiredModules) ? requiredModules : [];
+    const pendingBuild = autoRun && normalizedPrompt
+      ? {
+          prompt: normalizedPrompt,
+          templateId: templateId || "",
+          mode: forceMode || "auto",
+          modules: normalizedModules,
+          provider: provider || "openai",
+          runId: createRunId(),
+          createdAt: Date.now(),
+        }
+      : null;
+
     const project = createProject({
       userId: currentUser.id,
-      name: name || "Untitled",
+      title: name || "Untitled",
       provider: provider || "openai",
-      forceMode: forceMode || "auto",
+      mode: forceMode || "auto",
       templateId: templateId || "",
-      requiredModules: Array.isArray(requiredModules) ? requiredModules : [],
+      modules: normalizedModules,
+      seedPrompt: normalizedPrompt,
+      pendingBuild,
     });
-    setActiveProject(project.id);
+    setLastProject(project.id);
     setBuildRequest(
-      autoRun && prompt
-        ? {
-            id: Date.now(),
-            projectId: project.id,
-            prompt,
-            provider: provider || project.provider,
-            forceMode: forceMode || project.forceMode,
-            templateId: templateId || project.templateId || "",
-            requiredModules:
-              Array.isArray(requiredModules) && requiredModules.length > 0
-                ? requiredModules
-                : project.requiredModules || [],
-            mode: "generate",
-            source: "new-project",
-          }
-        : { id: Date.now(), projectId: project.id, source: "new-project" },
+      {
+        id: Date.now(),
+        projectId: project.id,
+        provider: provider || project.provider,
+        forceMode: forceMode || project.forceMode,
+        templateId: templateId || project.templateId || "",
+        requiredModules: normalizedModules,
+        source: "new-project",
+      },
     );
-    setRoute("builder");
+    navigateTo("builder", project.id);
   };
 
   const handleOpenProject = (projectId, request = null) => {
-    setActiveProject(projectId);
+    const existing = getProjectById(currentUser.id, projectId);
+    if (!existing) {
+      navigateTo("landing");
+      return;
+    }
+    setLastProject(projectId);
     setBuildRequest(request ? { ...request, id: Date.now(), projectId } : { id: Date.now(), projectId, source: "open-project" });
-    setRoute("builder");
+    navigateTo("builder", projectId);
   };
 
   const handleDeleteProject = (projectId) => {
     deleteProject(currentUser.id, projectId);
     refreshProjects();
+    if (window.location.pathname === pathForRoute("builder", projectId)) {
+      navigateTo("landing");
+    }
   };
 
-  if (route === "builder") {
+  useEffect(() => {
+    if (routeState.name !== "builder") {
+      return;
+    }
+
+    const exists = routeState.projectId ? getProjectById(currentUser.id, routeState.projectId) : null;
+    if (!exists) {
+      navigateTo("landing");
+      return;
+    }
+
+    setLastProject(routeState.projectId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeState.name, routeState.projectId, currentUser.id, projectsVersion]);
+
+  if (routeState.name === "builder") {
     return (
       <Builder
         user={currentUser}
-        activeProjectId={activeProjectId}
+        projectId={routeState.projectId}
         projects={projects}
         initialRequest={buildRequest}
         currentUser={currentUser}
@@ -142,7 +218,7 @@ export default function App() {
         onDeleteProject={handleDeleteProject}
         onProjectsChanged={refreshProjects}
         onBack={() => {
-          setRoute("landing");
+          navigateTo("landing");
         }}
       />
     );
@@ -152,7 +228,7 @@ export default function App() {
     <Landing
       user={currentUser}
       projects={projects}
-      activeProjectId={activeProjectId}
+      activeProjectId={lastProjectId}
       onContinueAsGuest={handleContinueAsGuest}
       onSignIn={handleSignIn}
       onCreateProject={handleCreateProject}

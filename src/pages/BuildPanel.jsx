@@ -34,6 +34,7 @@ export default function BuildPanel({
   lastResponseStatus,
   onApplySpec,
   assets,
+  agentEvents = [],
 }) {
   const [activeTab, setActiveTab] = useState("gamespec");
   const [isEditable, setIsEditable] = useState(false);
@@ -145,6 +146,21 @@ export default function BuildPanel({
           <div className="info-block">
             <h3>Last error</h3>
             <p>{lastErrorMessage || "No errors recorded."}</p>
+          </div>
+          <div className="info-block">
+            <h3>Agent events</h3>
+            {agentEvents.length > 0 ? (
+              <ul className="asset-list">
+                {agentEvents.slice(0, 8).map((event) => (
+                  <li key={event.id || `${event.type}-${event.createdAt || Math.random()}`}>
+                    <strong>{event.type || "event"}</strong>
+                    <span>{event.message || ""}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>No agent events yet.</p>
+            )}
           </div>
         </div>
       ) : null}

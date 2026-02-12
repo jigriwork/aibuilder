@@ -17,7 +17,37 @@ const SUPPORTED_GENERATE_MODES = ["generate", "patch"];
 const SESSION_CACHE = new Map();
 const MAX_SESSION_MESSAGES = 200;
 const MAX_SPEC_VERSIONS = 40;
-const MAX_AGENT_REPAIR_LOOPS = 3;
+const MAX_AGENT_REPAIR_ATTEMPTS = 2;
+const MAX_AGENT_CLARIFY_QUESTIONS = 3;
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+const runtimeCapabilities = {
+  physics3d: {
+    objects: ["ground", "box", "sphere", "ramp"],
+    player: true,
+    win: ["reachArea"],
+    lose: ["fallBelow"],
+    score: ["time"],
+    timer: true,
+    cameraFollow: true,
+    collisions: false,
+    audio: false,
+    multiplayer: false,
+    combat: false,
+    npcs: false,
+  },
+  board2d: {
+    dice: true,
+    turnBased: true,
+    tokenMove: true,
+    captureMaybe: false,
+    audio: false,
+    multiplayer: false,
+    combat: false,
+    npcs: false,
+  },
+};
 
 const PATCH_SYSTEM_INSTRUCTION =
   "You are updating an existing game specification. Modify only what user requests. Preserve all other systems, rules, and structure. Return full corrected GameSpec JSON.";
@@ -40,6 +70,28 @@ app.use(express.json({ limit: "1mb" }));
 
 function safeError(res, { provider = "openai", status = 500, error = "Unexpected server error", code, details }) {
   return res.status(status).json({ error, status, provider, code, details });
+}
+
+function scrubSensitiveText(value) {
+  return String(value || "")
+    .replace(/(key=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/(authorization:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]");
+}
+
+function getUserKey(req) {
+  const rawAuth = typeof req?.headers?.authorization === "string" ? req.headers.authorization.trim() : "";
+  const match = rawAuth.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || "";
+}
+
+function getModelProvider(req, bodyOrQuery = {}) {
+  const providerHeader =
+    typeof req?.headers?.["x-model-provider"] === "string"
+      ? req.headers["x-model-provider"].trim().toLowerCase()
+      : "";
+  const providerBody =
+    typeof bodyOrQuery?.provider === "string" ? bodyOrQuery.provider.trim().toLowerCase() : "";
+  return providerHeader || providerBody || "openai";
 }
 
 function createStructuredError(message, details = {}, code = "GENERATION_FAILED") {
@@ -74,17 +126,38 @@ function getSessionState(sessionId) {
     SESSION_CACHE.set(sessionId, {
       messages: [],
       specVersions: [],
+      runs: new Map(),
+      activeStreams: 0,
+      lastAccessAt: Date.now(),
     });
   }
 
   return SESSION_CACHE.get(sessionId);
 }
 
+function touchSession(sessionState) {
+  if (!sessionState) return;
+  sessionState.lastAccessAt = Date.now();
+}
+
+function sweepExpiredSessions() {
+  const now = Date.now();
+  for (const [sessionId, sessionState] of SESSION_CACHE.entries()) {
+    if (sessionState?.activeStreams > 0) continue;
+    const lastAccessAt = Number(sessionState?.lastAccessAt) || 0;
+    if (now - lastAccessAt > SESSION_TTL_MS) {
+      SESSION_CACHE.delete(sessionId);
+    }
+  }
+}
+
 function pushSessionMessage(sessionState, entry) {
+  touchSession(sessionState);
   sessionState.messages = [...sessionState.messages, entry].slice(-MAX_SESSION_MESSAGES);
 }
 
 function pushSessionSpecVersion(sessionState, gameSpec) {
+  touchSession(sessionState);
   sessionState.specVersions = [...sessionState.specVersions, gameSpec].slice(-MAX_SPEC_VERSIONS);
 }
 
@@ -415,20 +488,42 @@ function enrichAgentSpec(spec, { selection, plan, limitations = [] }) {
   return next;
 }
 
-function getAgentRequestPayload(bodyOrQuery = {}) {
-  const base = getRequestPayload(bodyOrQuery);
+function getAgentRequestPayload(req, bodyOrQuery = {}) {
+  const base = getRequestPayload(req, bodyOrQuery);
   const projectIdRaw = typeof bodyOrQuery?.projectId === "string" ? bodyOrQuery.projectId.trim() : "";
-  const userPromptRaw = typeof bodyOrQuery?.userPrompt === "string" ? bodyOrQuery.userPrompt : "";
+  const userPromptRaw =
+    typeof bodyOrQuery?.prompt === "string"
+      ? bodyOrQuery.prompt
+      : typeof bodyOrQuery?.userPrompt === "string"
+        ? bodyOrQuery.userPrompt
+        : "";
+  const runIdRaw = typeof bodyOrQuery?.runId === "string" ? bodyOrQuery.runId.trim() : "";
+  const requestModeRaw = typeof bodyOrQuery?.mode === "string" ? bodyOrQuery.mode.trim().toLowerCase() : "generate";
+  const modulesRaw = bodyOrQuery?.modules ?? bodyOrQuery?.requiredModules;
+  const answersRaw = bodyOrQuery?.answers;
+  const answers =
+    answersRaw && typeof answersRaw === "object" && !Array.isArray(answersRaw)
+      ? Object.fromEntries(
+          Object.entries(answersRaw)
+            .map(([key, value]) => [String(key), String(value ?? "").trim()])
+            .filter(([key, value]) => key && value),
+        )
+      : {};
 
   return {
     provider: base.provider,
-    apiKey: base.apiKey,
+    runId: runIdRaw,
     projectId: projectIdRaw || base.sessionId,
     sessionId: projectIdRaw || base.sessionId,
     userPrompt: String(userPromptRaw || base.message || "").trim(),
     currentSpec: base.currentSpec,
     templateId: base.templateId,
-    requiredModules: base.requiredModules,
+    requiredModules: parseRequiredModules(modulesRaw),
+    mode: SUPPORTED_GENERATE_MODES.includes(requestModeRaw) ? requestModeRaw : "generate",
+    answers,
+    specCursor: Number.isFinite(Number(bodyOrQuery?.specCursor)) ? Number(bodyOrQuery.specCursor) : -1,
+    messagesDelta: Array.isArray(bodyOrQuery?.messagesDelta) ? bodyOrQuery.messagesDelta : [],
+    clientInfo: bodyOrQuery?.clientInfo && typeof bodyOrQuery.clientInfo === "object" ? bodyOrQuery.clientInfo : null,
   };
 }
 
@@ -442,6 +537,315 @@ function buildMvpFallbackSpec({ selection, plan }) {
       ...(Array.isArray(plan?.limitations) ? plan.limitations : []),
     ],
   });
+}
+
+function normalizePromptText(value) {
+  return String(value || "").toLowerCase();
+}
+
+function uniqueStrings(values = []) {
+  return Array.from(new Set((values || []).filter(Boolean).map((item) => String(item))));
+}
+
+function detectUnsupportedRequests(prompt) {
+  const text = normalizePromptText(prompt);
+  const unsupported = [];
+
+  if (text.includes("multiplayer") || text.includes("online") || text.includes("co-op") || text.includes("coop")) {
+    unsupported.push("multiplayer");
+  }
+  if (text.includes("gun") || text.includes("combat") || text.includes("weapon") || text.includes("shoot")) {
+    unsupported.push("combat");
+  }
+  if (text.includes("npc") || text.includes("enemy ai") || text.includes("ai enemy")) {
+    unsupported.push("npcs");
+  }
+  if (text.includes("audio") || text.includes("music") || text.includes("sound")) {
+    unsupported.push("audio");
+  }
+  if (text.includes("collision callback") || text.includes("on collision") || text.includes("collision event")) {
+    unsupported.push("collisions");
+  }
+
+  return uniqueStrings(unsupported);
+}
+
+function buildClarifyQuestion({ prompt, answers, selection, unsupported }) {
+  const questions = [];
+  const hasAnswers = answers && typeof answers === "object" ? answers : {};
+  const modeIntent = selection?.intent || resolveMode(prompt, "auto");
+  const text = normalizePromptText(prompt);
+
+  if (
+    unsupported.length > 0
+    && !hasAnswers.scope_choice
+  ) {
+    questions.push({
+      questionId: "scope_choice",
+      text: `Your request includes unsupported features (${unsupported.join(", ")}). Choose a supported MVP direction to continue honestly.`,
+      choices: [
+        "single-player physics3d runner",
+        "single-player board2d dice/turn game",
+        "cancel",
+      ],
+      required: true,
+    });
+  }
+
+  const ambiguousPrompt = text.split(/\s+/).filter(Boolean).length <= 2;
+  if (ambiguousPrompt && !hasAnswers.mode_choice) {
+    questions.push({
+      questionId: "mode_choice",
+      text: "Should I build this as a 3D physics game or a 2D board game?",
+      choices: ["physics3d", "board2d"],
+      required: true,
+    });
+  }
+
+  if (modeIntent === "board2d" && !hasAnswers.board_style && !text.includes("ludo") && !text.includes("snake")) {
+    questions.push({
+      questionId: "board_style",
+      text: "For board2d MVP, do you want Ludo-style turn+dice movement?",
+      choices: ["yes, ludo-style", "no, keep it generic turn+dice"],
+      required: true,
+    });
+  }
+
+  return questions.slice(0, MAX_AGENT_CLARIFY_QUESTIONS);
+}
+
+function inferModeFromAnswers(selection, answers = {}) {
+  const modeChoice = String(answers.mode_choice || "").toLowerCase();
+  if (modeChoice.includes("board")) return "board2d";
+  if (modeChoice.includes("physics") || modeChoice.includes("3d")) return "physics3d";
+
+  const scopeChoice = String(answers.scope_choice || "").toLowerCase();
+  if (scopeChoice.includes("board")) return "board2d";
+  if (scopeChoice.includes("physics") || scopeChoice.includes("runner")) return "physics3d";
+
+  return selection?.intent || "physics3d";
+}
+
+function sanitizeUnsupportedTopLevelFields(spec) {
+  const next = JSON.parse(JSON.stringify(spec || {}));
+  const unsupportedTopKeys = [
+    "audio",
+    "multiplayer",
+    "network",
+    "combat",
+    "npcs",
+    "enemies",
+    "weapons",
+    "collisionCallbacks",
+    "callbacks",
+  ];
+
+  for (const key of unsupportedTopKeys) {
+    if (key in next) {
+      delete next[key];
+    }
+  }
+
+  return next;
+}
+
+function capabilityCheck(spec, capabilities) {
+  const reasons = [];
+  const suggestedFixes = [];
+  if (!spec || typeof spec !== "object") {
+    return {
+      ok: false,
+      reasons: ["Spec must be an object."],
+      suggestedFixes: ["Generate a valid GameSpec object."],
+    };
+  }
+
+  const mode = spec.mode;
+  if (!mode || !capabilities?.[mode]) {
+    return {
+      ok: false,
+      reasons: ["spec.mode must be either board2d or physics3d."],
+      suggestedFixes: ["Set mode to board2d or physics3d and keep only that runtime's mechanics."],
+    };
+  }
+
+  const serialized = JSON.stringify(spec).toLowerCase();
+  if (serialized.includes("multiplayer") || serialized.includes("network")) {
+    reasons.push("Multiplayer/network fields are unsupported.");
+    suggestedFixes.push("Remove multiplayer/network fields and keep single-player mechanics.");
+  }
+  if (serialized.includes("audio") || serialized.includes("sound") || serialized.includes("music")) {
+    reasons.push("Audio fields are unsupported.");
+    suggestedFixes.push("Remove audio/sound/music fields.");
+  }
+  if (serialized.includes("combat") || serialized.includes("weapon") || serialized.includes("gun")) {
+    reasons.push("Combat/weapon systems are unsupported.");
+    suggestedFixes.push("Replace combat with movement + objective mechanics.");
+  }
+  if (serialized.includes("npc") || serialized.includes("enemy")) {
+    reasons.push("NPC/enemy systems are unsupported.");
+    suggestedFixes.push("Remove NPC/enemy systems and use static obstacles.");
+  }
+
+  if (mode === "physics3d") {
+    const caps = capabilities.physics3d;
+    const objects = Array.isArray(spec?.scene?.objects) ? spec.scene.objects : [];
+    const invalidObjects = objects
+      .map((obj) => obj?.type)
+      .filter((type) => type && !caps.objects.includes(type));
+    if (invalidObjects.length > 0) {
+      reasons.push(`Unsupported physics3d object types: ${uniqueStrings(invalidObjects).join(", ")}.`);
+      suggestedFixes.push(`Use only scene object types: ${caps.objects.join(", ")}.`);
+    }
+
+    const winRules = Array.isArray(spec?.rules?.win) ? spec.rules.win : [];
+    const loseRules = Array.isArray(spec?.rules?.lose) ? spec.rules.lose : [];
+    const scoreRules = Array.isArray(spec?.rules?.score) ? spec.rules.score : [];
+
+    const invalidWin = winRules.map((rule) => rule?.type).filter((type) => type && !caps.win.includes(type));
+    const invalidLose = loseRules.map((rule) => rule?.type).filter((type) => type && !caps.lose.includes(type));
+    const invalidScore = scoreRules.map((rule) => rule?.type).filter((type) => type && !caps.score.includes(type));
+
+    if (invalidWin.length > 0) {
+      reasons.push(`Unsupported physics3d win rules: ${uniqueStrings(invalidWin).join(", ")}.`);
+      suggestedFixes.push(`Use win rules: ${caps.win.join(", ")}.`);
+    }
+    if (invalidLose.length > 0) {
+      reasons.push(`Unsupported physics3d lose rules: ${uniqueStrings(invalidLose).join(", ")}.`);
+      suggestedFixes.push(`Use lose rules: ${caps.lose.join(", ")}.`);
+    }
+    if (invalidScore.length > 0) {
+      reasons.push(`Unsupported physics3d score rules: ${uniqueStrings(invalidScore).join(", ")}.`);
+      suggestedFixes.push(`Use score rules: ${caps.score.join(", ")}.`);
+    }
+  }
+
+  if (mode === "board2d") {
+    const hasDice = Boolean(spec?.board2d?.rules?.dice);
+    const hasPlayers = Array.isArray(spec?.board2d?.players) && spec.board2d.players.length > 0;
+    if (!hasDice) {
+      reasons.push("board2d requires dice rules.");
+      suggestedFixes.push("Add board2d.rules.dice with min/max values.");
+    }
+    if (!hasPlayers) {
+      reasons.push("board2d requires at least one player token.");
+      suggestedFixes.push("Add board2d.players entries for token movement.");
+    }
+
+    if (spec?.scene || spec?.player || spec?.camera) {
+      reasons.push("board2d does not support physics3d scene/player/camera fields.");
+      suggestedFixes.push("Remove scene/player/camera from board2d specs.");
+    }
+
+    if (Array.isArray(spec?.rules?.win) || Array.isArray(spec?.rules?.lose) || Array.isArray(spec?.rules?.score)) {
+      reasons.push("board2d runtime only supports dice + per-turn token movement rules.");
+      suggestedFixes.push("Remove physics-style win/lose/score rule arrays from board2d specs.");
+    }
+  }
+
+  return reasons.length > 0
+    ? { ok: false, reasons: uniqueStrings(reasons), suggestedFixes: uniqueStrings(suggestedFixes) }
+    : { ok: true };
+}
+
+function repairSpecAgainstCapabilities(spec, capabilities) {
+  const next = sanitizeUnsupportedTopLevelFields(spec);
+  if (next.mode === "physics3d") {
+    const caps = capabilities.physics3d;
+    if (!next.scene || !Array.isArray(next.scene.objects)) {
+      next.scene = { objects: [] };
+    }
+    next.scene.objects = next.scene.objects.filter((obj) => caps.objects.includes(obj?.type));
+    if (!next.scene.objects.some((obj) => obj?.type === "ground")) {
+      next.scene.objects.unshift({
+        type: "ground",
+        size: [40, 1, 40],
+        position: [0, -0.5, 0],
+        color: "#334155",
+      });
+    }
+
+    if (!next.rules || typeof next.rules !== "object") {
+      next.rules = {};
+    }
+    next.rules.win = (Array.isArray(next.rules.win) ? next.rules.win : []).filter((rule) => caps.win.includes(rule?.type));
+    next.rules.lose = (Array.isArray(next.rules.lose) ? next.rules.lose : []).filter((rule) => caps.lose.includes(rule?.type));
+    next.rules.score = (Array.isArray(next.rules.score) ? next.rules.score : []).filter((rule) => caps.score.includes(rule?.type));
+
+    if (!Array.isArray(next.rules.win) || next.rules.win.length === 0) {
+      next.rules.win = [{ type: "reachArea", position: [0, 1, -20], radius: 3 }];
+    }
+    if (!Array.isArray(next.rules.lose) || next.rules.lose.length === 0) {
+      next.rules.lose = [{ type: "fallBelow", y: -6 }];
+    }
+  }
+
+  if (next.mode === "board2d") {
+    delete next.scene;
+    delete next.player;
+    delete next.camera;
+
+    if (!next.board2d || typeof next.board2d !== "object") {
+      next.board2d = { game: "ludo", size: 15, players: [] };
+    }
+    if (!Array.isArray(next.board2d.players) || next.board2d.players.length === 0) {
+      next.board2d.players = [
+        { id: "p1", name: "Player 1", color: "#ef4444" },
+        { id: "p2", name: "Player 2", color: "#3b82f6" },
+      ];
+    }
+    if (!next.board2d.rules || typeof next.board2d.rules !== "object") {
+      next.board2d.rules = {};
+    }
+    if (!next.board2d.rules.dice || typeof next.board2d.rules.dice !== "object") {
+      next.board2d.rules.dice = { min: 1, max: 6 };
+    }
+
+    if (!next.rules || typeof next.rules !== "object") {
+      next.rules = {};
+    }
+    delete next.rules.win;
+    delete next.rules.lose;
+    delete next.rules.score;
+  }
+
+  return next;
+}
+
+function getSupportedMechanicsForMode(mode) {
+  if (mode === "board2d") {
+    return ["dice", "turn-based flow", "per-turn token movement"];
+  }
+  return [
+    "scene objects: ground/box/sphere/ramp",
+    "player move + jump",
+    "camera follow",
+    "timer/score by time",
+    "win by reachArea",
+    "lose by fallBelow",
+  ];
+}
+
+function getUnsupportedMechanicsSummary(unsupported = []) {
+  const base = [
+    "no collision callbacks",
+    "no audio/music",
+    "no multiplayer/networking",
+    "no combat/weapon systems",
+    "no NPC/enemy AI systems",
+  ];
+  const mapped = (unsupported || []).map((item) => `requested but unsupported: ${item}`);
+  return uniqueStrings([...mapped, ...base]);
+}
+
+function buildAlternativeSpecSuggestion({ prompt, mode, preferredTemplateId = "" }) {
+  const selection = classifyPromptToTemplate({
+    prompt,
+    forceMode: mode,
+    preferredTemplateId,
+  });
+  const fallback = applyTemplateToSpec(selection.template.defaultSpec, selection);
+  return repairSpecAgainstCapabilities(fallback, runtimeCapabilities);
 }
 
 function buildUserPrompt({ mode, message, forcedMode, currentSpec, sessionMessages, selection }) {
@@ -702,9 +1106,9 @@ function parseRequiredModules(raw) {
     .filter(Boolean);
 }
 
-function getRequestPayload(bodyOrQuery = {}) {
-  const provider =
-    typeof bodyOrQuery?.provider === "string" ? bodyOrQuery.provider.trim().toLowerCase() : "openai";
+function getRequestPayload(req, bodyOrQuery = {}) {
+  const provider = getModelProvider(req, bodyOrQuery);
+  const apiKey = getUserKey(req);
 
   const messageRaw =
     typeof bodyOrQuery?.message === "string"
@@ -721,8 +1125,8 @@ function getRequestPayload(bodyOrQuery = {}) {
 
   return {
     provider,
+    apiKey,
     message: messageRaw.trim(),
-    apiKey: typeof bodyOrQuery?.apiKey === "string" ? bodyOrQuery.apiKey.trim() : "",
     mode: SUPPORTED_GENERATE_MODES.includes(requestedModeRaw) ? requestedModeRaw : "generate",
     forceMode: SUPPORTED_FORCE_MODES.includes(requestedForceModeRaw) ? requestedForceModeRaw : "auto",
     templateId: typeof bodyOrQuery?.templateId === "string" ? bodyOrQuery.templateId.trim() : "",
@@ -749,7 +1153,7 @@ function validateRequestInput({ provider, message, apiKey, mode, currentSpec }, 
   }
 
   if (!apiKey || apiKey.length < 20) {
-    safeError(res, { provider, status: 400, error: "Add your API key in Jigrify Settings" });
+    safeError(res, { provider, status: 400, error: "BYOK required: send Authorization: Bearer <key>." });
     return false;
   }
 
@@ -762,7 +1166,8 @@ function validateRequestInput({ provider, message, apiKey, mode, currentSpec }, 
 }
 
 app.post("/api/generate", async (req, res) => {
-  const payload = getRequestPayload(req.body);
+  sweepExpiredSessions();
+  const payload = getRequestPayload(req, req.body);
   const { provider, message, apiKey, mode, forceMode, templateId, requiredModules, currentSpec, sessionId } = payload;
 
   if (!validateRequestInput(payload, res)) return;
@@ -834,8 +1239,9 @@ app.post("/api/generate", async (req, res) => {
   }
 });
 
-app.get("/api/generate/stream", async (req, res) => {
-  const payload = getRequestPayload(req.query);
+app.post("/api/generate/stream", async (req, res) => {
+  sweepExpiredSessions();
+  const payload = getRequestPayload(req, req.body);
   const { provider, message, apiKey, mode, forceMode, templateId, requiredModules, currentSpec, sessionId } = payload;
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -890,7 +1296,7 @@ app.get("/api/generate/stream", async (req, res) => {
   }
 
   if (!apiKey || apiKey.length < 20) {
-    endWithError(400, { message: "Add your API key in Jigrify Settings" });
+    endWithError(400, { message: "BYOK required: send Authorization: Bearer <key>." });
     return;
   }
 
@@ -1046,14 +1452,34 @@ app.get("/api/generate/stream", async (req, res) => {
     }
 
     endWithError(500, {
-      message: error instanceof Error ? error.message : "Generation failed. Check your key/network and retry.",
+      message: scrubSensitiveText(
+        error instanceof Error ? error.message : "Generation failed. Check your key/network and retry.",
+      ),
     });
   }
 });
 
-app.get("/api/agent/stream", async (req, res) => {
-  const payload = getAgentRequestPayload(req.query);
-  const { provider, apiKey, userPrompt, currentSpec, templateId, requiredModules, sessionId, projectId } = payload;
+app.post("/api/agent/stream", async (req, res) => {
+  sweepExpiredSessions();
+  const payload = getAgentRequestPayload(req, req.body);
+  const {
+    provider,
+    runId,
+    userPrompt,
+    currentSpec,
+    templateId,
+    requiredModules,
+    sessionId,
+    projectId,
+    mode,
+    specCursor,
+    answers,
+  } = payload;
+  const apiKey = getUserKey(req);
+  const effectiveSessionId = sessionId || projectId || resolveSessionId("");
+  const effectiveRunId = runId || `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sessionState = getSessionState(effectiveSessionId);
+  touchSession(sessionState);
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -1062,34 +1488,106 @@ app.get("/api/agent/stream", async (req, res) => {
   res.flushHeaders();
 
   let closed = false;
+  let streamCounted = false;
+  const finalizeStream = () => {
+    if (streamCounted) {
+      sessionState.activeStreams = Math.max(0, Number(sessionState.activeStreams || 0) - 1);
+      streamCounted = false;
+    }
+    touchSession(sessionState);
+  };
+
   req.on("close", () => {
     closed = true;
+    finalizeStream();
   });
 
-  const sendEvent = (eventName, eventPayload) => {
+  const existingRunState = sessionState.runs.get(effectiveRunId);
+  const sendEnvelope = (eventName, type, eventPayload) => {
     if (closed) return;
+    const record = sessionState.runs.get(effectiveRunId);
+    const eventId = Math.max(1, Number(record?.nextEventId || 1));
+    if (record) {
+      record.nextEventId = eventId + 1;
+      sessionState.runs.set(effectiveRunId, record);
+    }
+    const envelope = {
+      runId: effectiveRunId,
+      eventId,
+      type,
+      payload: eventPayload,
+    };
+    touchSession(sessionState);
     res.write(`event: ${eventName}\n`);
-    res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
+    res.write(`data: ${JSON.stringify(envelope)}\n\n`);
   };
 
   const endWithError = (status, errPayload) => {
-    sendEvent("error", { status, ...errPayload });
-    sendEvent("build_error", { status, ...errPayload });
+    const safePayload = {
+      status,
+      ...errPayload,
+      message: scrubSensitiveText(errPayload?.message || "Request failed."),
+    };
+    sendEnvelope("error", "error", safePayload);
+    sendEnvelope("build_error", "build_error", safePayload);
     if (!closed) res.end();
+    finalizeStream();
   };
+
+  if (existingRunState?.status === "completed") {
+    sendEnvelope("run_already_completed", "run_already_completed", {
+      message: "run_already_completed",
+      finalSpec: existingRunState.finalSpec || null,
+    });
+    if (!closed) res.end();
+    return;
+  }
+
+  if (existingRunState?.status === "in_progress" && existingRunState?.agentState !== "clarify_waiting") {
+    sendEnvelope("run_in_progress", "run_in_progress", {
+      message: "run_in_progress",
+    });
+    if (!closed) res.end();
+    return;
+  }
+
+  const runState = existingRunState || {
+    status: "in_progress",
+    agentState: "clarify",
+    nextEventId: 1,
+    finalSpec: null,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    originalPrompt: userPrompt,
+    answers: {},
+    clarifyQuestionsAsked: 0,
+    verifyFailures: [],
+  };
+
+  runState.status = "in_progress";
+  runState.originalPrompt = runState.originalPrompt || userPrompt;
+  runState.answers = {
+    ...(runState.answers || {}),
+    ...(answers || {}),
+  };
+  sessionState.runs.set(effectiveRunId, runState);
+
+  sessionState.activeStreams = Number(sessionState.activeStreams || 0) + 1;
+  streamCounted = true;
 
   if (!SUPPORTED_PROVIDERS.includes(provider)) {
     endWithError(400, { message: "Provider must be openai or gemini." });
     return;
   }
 
-  if (!userPrompt) {
-    endWithError(400, { message: "userPrompt is required." });
+  const originalPrompt = runState.originalPrompt || userPrompt;
+  if (!originalPrompt) {
+    endWithError(400, { message: "prompt is required." });
     return;
   }
 
   if (!apiKey || apiKey.length < 20) {
-    endWithError(400, { message: "Add your API key in Jigrify Settings" });
+    endWithError(400, { message: "BYOK required: send Authorization: Bearer <key>." });
     return;
   }
 
@@ -1098,51 +1596,90 @@ app.get("/api/agent/stream", async (req, res) => {
     return;
   }
 
-  const sessionState = getSessionState(sessionId || projectId || resolveSessionId(""));
+  const cursorSpec =
+    Number.isInteger(specCursor) && specCursor >= 0
+      ? sessionState.specVersions[specCursor] || null
+      : null;
+  const fallbackSpec = sessionState.specVersions[sessionState.specVersions.length - 1] || null;
+  const effectiveCurrentSpec = currentSpec || (mode === "patch" ? cursorSpec || fallbackSpec : null);
 
   try {
     pushSessionMessage(sessionState, {
       role: "user",
-      message: userPrompt,
+      message: Object.keys(answers || {}).length > 0
+        ? `Clarification provided: ${JSON.stringify(answers)}`
+        : originalPrompt,
       createdAt: new Date().toISOString(),
     });
 
-    sendEvent("chat_message", {
-      role: "assistant",
-      message: "Brain loop started: Plan → Build → Verify → Repair (if needed).",
-    });
-
-    sendEvent("phase_update", {
-      phase: "plan",
-      status: "running",
-      message: "Understanding request and selecting MVP strategy.",
-    });
-
-    const plan = await generateAgentPlan({
-      provider,
-      apiKey,
-      userPrompt,
+    const selectionPreview = classifyPromptToTemplate({
+      prompt: originalPrompt,
+      forceMode: getTemplateById(templateId || "")?.mode || "auto",
       preferredTemplateId: templateId,
-      currentSpec,
     });
 
-    sendEvent("chat_message", {
-      role: "assistant",
-      message: `Plan ready: ${plan.mvpDefinition}`,
-      meta: { type: "plan", plan },
+    const unsupported = detectUnsupportedRequests(originalPrompt);
+    const clarifyQuestions = buildClarifyQuestion({
+      prompt: originalPrompt,
+      answers: runState.answers,
+      selection: selectionPreview,
+      unsupported,
     });
 
-    sendEvent("phase_update", {
-      phase: "plan",
-      status: "done",
-      plan,
-    });
+    if (clarifyQuestions.length > 0 && runState.clarifyQuestionsAsked < MAX_AGENT_CLARIFY_QUESTIONS) {
+      const question = clarifyQuestions[0];
+      runState.status = "in_progress";
+      runState.agentState = "clarify_waiting";
+      runState.pendingQuestion = question;
+      runState.clarifyQuestionsAsked = Number(runState.clarifyQuestionsAsked || 0) + 1;
+      sessionState.runs.set(effectiveRunId, runState);
 
-    const forcedTemplate = getTemplateById(plan.templateId || templateId || "");
+      sendEnvelope("clarify_question", "clarify_question", question);
+      if (!closed) res.end();
+      finalizeStream();
+      return;
+    }
+
+    const scopeChoice = String(runState.answers?.scope_choice || "").toLowerCase();
+    if (scopeChoice.includes("cancel")) {
+      const alternativeSpec = buildAlternativeSpecSuggestion({
+        prompt: originalPrompt,
+        mode: inferModeFromAnswers(selectionPreview, runState.answers),
+        preferredTemplateId: templateId,
+      });
+
+      sendEnvelope("cannot_build", "cannot_build", {
+        reason: "User selected cancel for unsupported feature scope.",
+        unsupported,
+        suggestion:
+          "Try a supported MVP such as a single-player physics3d runner or board2d dice-turn game.",
+        alternativeSpec,
+      });
+      sendEnvelope("done", "done", { status: "cannot_build" });
+
+      sessionState.runs.set(effectiveRunId, {
+        ...runState,
+        status: "completed",
+        agentState: "done",
+        finalSpec: null,
+        completedAt: new Date().toISOString(),
+      });
+
+      if (!closed) res.end();
+      finalizeStream();
+      return;
+    }
+
+    runState.agentState = "plan";
+    runState.pendingQuestion = null;
+    sessionState.runs.set(effectiveRunId, runState);
+
+    const resolvedMode = inferModeFromAnswers(selectionPreview, runState.answers);
+    const selectedTemplate = getTemplateById(templateId || "");
     let selection = classifyPromptToTemplate({
-      prompt: userPrompt,
-      forceMode: forcedTemplate?.mode || plan.mode,
-      preferredTemplateId: forcedTemplate?.id || templateId,
+      prompt: originalPrompt,
+      forceMode: selectedTemplate?.mode || resolvedMode,
+      preferredTemplateId: selectedTemplate?.id || templateId,
     });
 
     selection = {
@@ -1153,172 +1690,200 @@ app.get("/api/agent/stream", async (req, res) => {
           : selection.modulesEnabled,
     };
 
-    let workingSpec = currentSpec || null;
-    let verified = false;
-    let finalSpec = null;
-    let lastVerify = null;
+    const planPayload = {
+      mode: resolvedMode,
+      templateId: selection.templateId,
+      mechanics: getSupportedMechanicsForMode(resolvedMode),
+      willNotImplement: getUnsupportedMechanicsSummary(unsupported),
+      canAddLater: Array.isArray(selection.upgradePath) ? selection.upgradePath : [],
+      answersUsed: runState.answers,
+    };
 
-    for (let attempt = 0; attempt <= MAX_AGENT_REPAIR_LOOPS; attempt += 1) {
-      if (attempt === 0) {
-        sendEvent("phase_update", {
-          phase: "build",
-          status: "running",
-          message: "Building initial GameSpec from plan.",
-        });
+    sendEnvelope("plan", "plan", planPayload);
 
-        const built = await generateGameSpec({
-          provider,
-          apiKey,
-          message: userPrompt,
-          mode: workingSpec ? "patch" : "generate",
-          currentSpec: workingSpec,
-          forceMode: plan.mode,
-          sessionMessages: sessionState.messages,
-          preferredTemplateId: selection.templateId,
-          requiredModules: selection.modulesEnabled,
-        });
+    runState.agentState = "build";
+    sessionState.runs.set(effectiveRunId, runState);
 
-        workingSpec = enrichAgentSpec(built.gameSpec, {
-          selection: built.selection,
-          plan,
-          limitations: plan.limitations,
-        });
-        selection = built.selection;
+    const answerContext = Object.keys(runState.answers || {}).length > 0
+      ? `Clarification answers: ${JSON.stringify(runState.answers)}`
+      : "";
+    const buildPrompt = [originalPrompt, answerContext].filter(Boolean).join("\n\n");
 
-        sendEvent("spec_update", workingSpec);
-        sendEvent("phase_update", { phase: "build", status: "done" });
-      } else {
-        sendEvent("phase_update", {
-          phase: `repair_${attempt}`,
-          status: "running",
-          message: `Repair #${attempt}: fixing verification issues.`,
-          verify: lastVerify,
-        });
+    const built = await generateGameSpec({
+      provider,
+      apiKey,
+      message: buildPrompt,
+      mode: effectiveCurrentSpec ? "patch" : "generate",
+      currentSpec: effectiveCurrentSpec,
+      forceMode: resolvedMode,
+      sessionMessages: sessionState.messages,
+      preferredTemplateId: selection.templateId,
+      requiredModules: selection.modulesEnabled,
+    });
 
-        const repairInstruction = [
-          userPrompt,
-          "Repair the current spec to satisfy missing mechanics using only supported modules.",
-          `Missing items: ${(lastVerify?.missing || []).join("; ")}`,
-        ].join("\n\n");
+    let workingSpec = sanitizeUnsupportedTopLevelFields(
+      enrichAgentSpec(built.gameSpec, {
+        selection: built.selection,
+        plan: {
+          mvpDefinition: `Playable ${resolvedMode} MVP with supported mechanics only.`,
+          limitations: planPayload.willNotImplement,
+        },
+        limitations: planPayload.willNotImplement,
+      }),
+    );
+    selection = built.selection;
 
-        const repaired = await generateGameSpec({
-          provider,
-          apiKey,
-          message: repairInstruction,
-          mode: "patch",
-          currentSpec: workingSpec,
-          forceMode: plan.mode,
-          sessionMessages: sessionState.messages,
-          preferredTemplateId: selection.templateId,
-          requiredModules: selection.modulesEnabled,
-        });
+    const runVerify = (spec) => {
+      const schemaError = validateGameSpec(
+        spec,
+        resolvedMode,
+        selection.template,
+        Array.isArray(selection.modulesEnabled) ? selection.modulesEnabled : [],
+      );
+      const capability = capabilityCheck(spec, runtimeCapabilities);
+      const reasons = [
+        ...(schemaError ? [schemaError] : []),
+        ...(!capability.ok ? capability.reasons || [] : []),
+      ];
+      const suggestedFixes = !capability.ok ? capability.suggestedFixes || [] : [];
 
-        workingSpec = enrichAgentSpec(repaired.gameSpec, {
-          selection: repaired.selection,
-          plan,
-          limitations: plan.limitations,
-        });
-        selection = repaired.selection;
+      return {
+        ok: reasons.length === 0,
+        reasons,
+        suggestedFixes,
+      };
+    };
 
-        sendEvent("spec_update", workingSpec);
-        sendEvent("phase_update", { phase: `repair_${attempt}`, status: "done" });
-      }
+    runState.agentState = "verify";
+    sessionState.runs.set(effectiveRunId, runState);
 
-      sendEvent("phase_update", {
-        phase: "verify",
-        status: "running",
-        message: "Verifying schema, module support, and planned mechanics.",
+    let verifyResult = runVerify(workingSpec);
+    if (verifyResult.ok) {
+      sendEnvelope("verify_pass", "verify_pass", {
+        message: "Spec passed schema + capability checks.",
+      });
+    } else {
+      sendEnvelope("verify_fail", "verify_fail", {
+        reasons: verifyResult.reasons,
+        suggestedFixes: verifyResult.suggestedFixes,
+      });
+    }
+
+    let repairAttempt = 0;
+    while (!verifyResult.ok && repairAttempt < MAX_AGENT_REPAIR_ATTEMPTS) {
+      repairAttempt += 1;
+      runState.agentState = "repair";
+      sessionState.runs.set(effectiveRunId, runState);
+
+      sendEnvelope("repair_attempt", "repair_attempt", {
+        attempt: repairAttempt,
+        reasons: verifyResult.reasons,
+        action: "Removing unsupported mechanics and simplifying to supported equivalents.",
       });
 
-      const verify = verifyAgentSpec({
-        spec: workingSpec,
-        plan,
-        selection,
-        forcedMode: plan.mode,
-      });
+      workingSpec = repairSpecAgainstCapabilities(workingSpec, runtimeCapabilities);
+      workingSpec = sanitizeUnsupportedTopLevelFields(workingSpec);
 
-      lastVerify = verify;
-      if (verify.ok) {
-        verified = true;
-        finalSpec = workingSpec;
-        sendEvent("phase_update", { phase: "verify", status: "done" });
+      runState.agentState = "verify";
+      sessionState.runs.set(effectiveRunId, runState);
+      verifyResult = runVerify(workingSpec);
+
+      if (verifyResult.ok) {
+        sendEnvelope("verify_pass", "verify_pass", {
+          message: `Spec passed verify after repair attempt ${repairAttempt}.`,
+        });
         break;
       }
 
-      sendEvent("phase_update", {
-        phase: "verify",
-        status: "failed",
-        missing: verify.missing,
-      });
-
-      sendEvent("chat_message", {
-        role: "assistant",
-        message: `Verification found issues: ${(verify.missing || []).join(" | ")}`,
-        meta: { type: "verify_error", verify },
+      sendEnvelope("verify_fail", "verify_fail", {
+        reasons: verifyResult.reasons,
+        suggestedFixes: verifyResult.suggestedFixes,
       });
     }
 
-    if (!verified) {
-      finalSpec = buildMvpFallbackSpec({ selection, plan });
-      sendEvent("chat_message", {
-        role: "assistant",
-        message:
-          "Could not satisfy all requested mechanics in repair budget. Returning truthful MVP fallback and listing limitations.",
+    if (!verifyResult.ok) {
+      const alternativeSpec = buildAlternativeSpecSuggestion({
+        prompt: originalPrompt,
+        mode: resolvedMode,
+        preferredTemplateId: selection.templateId,
       });
-      sendEvent("phase_update", {
-        phase: "fallback",
-        status: "done",
-        limitations: plan.limitations,
+
+      sendEnvelope("cannot_build", "cannot_build", {
+        reason: "Could not produce a fully valid spec within repair budget.",
+        verifyReasons: verifyResult.reasons,
+        suggestedFixes: verifyResult.suggestedFixes,
+        suggestion:
+          resolvedMode === "board2d"
+            ? "Try a Ludo-style board2d MVP: dice + turn order + token movement."
+            : "Try a single-player 3D runner MVP: obstacles + reachArea + fallBelow.",
+        alternativeSpec,
       });
-      sendEvent("spec_update", finalSpec);
+      sendEnvelope("done", "done", { status: "cannot_build" });
+
+      sessionState.runs.set(effectiveRunId, {
+        ...runState,
+        status: "completed",
+        agentState: "done",
+        finalSpec: null,
+        completedAt: new Date().toISOString(),
+      });
+
+      if (!closed) res.end();
+      finalizeStream();
+      return;
     }
 
-    pushSessionSpecVersion(sessionState, finalSpec);
+    pushSessionSpecVersion(sessionState, workingSpec);
     pushSessionMessage(sessionState, {
       role: "assistant",
       message: "Agent build ready.",
       createdAt: new Date().toISOString(),
     });
 
-    sendEvent("phase_update", {
-      phase: "ready",
-      status: "done",
-      retriesUsed: verified ? Math.max(0, (lastVerify?.ok ? 0 : MAX_AGENT_REPAIR_LOOPS)) : MAX_AGENT_REPAIR_LOOPS,
+    sendEnvelope("spec", "spec", workingSpec);
+    sendEnvelope("done", "done", {
+      status: "ok",
+      mode: resolvedMode,
+      templateId: selection.templateId,
+      repairsUsed: repairAttempt,
     });
 
-    sendEvent("spec", finalSpec);
-    sendEvent("chat_message", {
-      role: "assistant",
-      message: "Ready: playable MVP generated.",
-      meta: {
-        type: "ready",
-        plan,
-        limitations: plan.limitations,
-      },
+    sessionState.runs.set(effectiveRunId, {
+      ...runState,
+      status: "completed",
+      agentState: "done",
+      finalSpec: workingSpec,
+      completedAt: new Date().toISOString(),
     });
 
     if (!closed) res.end();
+    finalizeStream();
   } catch (error) {
-    endWithError(500, {
-      message: error instanceof Error ? error.message : "Agent build failed.",
-    });
+    const safeMessage = scrubSensitiveText(error instanceof Error ? error.message : "Agent build failed.");
+    endWithError(500, { message: safeMessage });
   }
 });
 
+const getHealthPayload = () => ({
+  ok: true,
+  providerSupport: SUPPORTED_PROVIDERS,
+  templateSupport: getPublicTemplates().map((template) => ({
+    id: template.id,
+    name: template.name,
+    mode: template.mode,
+    requiredModules: template.requiredModules,
+    promptHints: template.promptHints,
+  })),
+  sessionCount: SESSION_CACHE.size,
+  time: new Date().toISOString(),
+});
+
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    providerSupport: SUPPORTED_PROVIDERS,
-    templateSupport: getPublicTemplates().map((template) => ({
-      id: template.id,
-      name: template.name,
-      mode: template.mode,
-      requiredModules: template.requiredModules,
-      promptHints: template.promptHints,
-    })),
-    sessionCount: SESSION_CACHE.size,
-    time: new Date().toISOString(),
-  });
+  res.json(getHealthPayload());
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json(getHealthPayload());
 });
 
 app.get("/api/templates", (_req, res) => {
@@ -1337,3 +1902,11 @@ app.get("/api/templates", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
+
+const sessionSweepTimer = setInterval(() => {
+  sweepExpiredSessions();
+}, SESSION_SWEEP_INTERVAL_MS);
+
+if (typeof sessionSweepTimer?.unref === "function") {
+  sessionSweepTimer.unref();
+}

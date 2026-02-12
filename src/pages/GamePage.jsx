@@ -5,9 +5,9 @@ import BuildPanel from "./BuildPanel";
 import ConsoleDrawer from "./ConsoleDrawer";
 import "./gamePage.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
+const API_BASE = (import.meta.env.VITE_API_BASE || "").trim();
 const GENERATE_URL = `${API_BASE}/api/generate`;
-const HEALTH_URL = `${API_BASE}/health`;
+const HEALTH_URL = `${API_BASE}/api/health`;
 const PROVIDER_KEY = "jigrify_provider";
 const OPENAI_KEY = "jigrify_openai_key";
 const GEMINI_KEY = "jigrify_gemini_key";
@@ -125,11 +125,13 @@ export default function GamePage() {
     const requestStarted = performance.now();
     const response = await fetch(GENERATE_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "X-Model-Provider": providerName,
+      },
       body: JSON.stringify({
-        provider: providerName,
         prompt: generationPrompt,
-        apiKey,
         previousSpec: previousSpec || undefined,
       }),
     });

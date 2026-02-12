@@ -1,15 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import GameViewport from "../runtime/GameViewport";
-import Board2DView from "../runtime/board2d/Board2DView";
 import { upsertProject } from "../lib/projects";
-import { classifyPromptToTemplate, getTemplateById } from "../lib/templates";
+import { applyTemplateToSpec, classifyPromptToTemplate, getTemplateById } from "../lib/templates";
+import Badge from "../components/ui/Badge";
+import Button from "../components/ui/Button";
+import Card, { CardBody } from "../components/ui/Card";
+import IconButton from "../components/ui/IconButton";
+import Input from "../components/ui/Input";
+import Toast from "../components/ui/Toast";
+
+import BuildPanel from "../components/builder/BuildPanel";
+import TimelineDrawer from "../components/builder/TimelineDrawer";
+import ClarifyCard from "../components/builder/ClarifyCard";
+import WorkspaceDrawer from "../components/builder/WorkspaceDrawer";
+import PreviewStage from "../components/builder/PreviewStage";
+
 import "./builder.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
-const GENERATE_STREAM_URL = `${API_BASE}/api/generate/stream`;
+const API_BASE = (import.meta.env.VITE_API_BASE || "").trim();
 const AGENT_STREAM_URL = `${API_BASE}/api/agent/stream`;
 const GENERATE_URL = `${API_BASE}/api/generate`;
-const HEALTH_URL = `${API_BASE}/health`;
+const HEALTH_URL = `${API_BASE}/api/health`;
 
 const OPENAI_KEY = "jigrify_openai_key";
 const GEMINI_KEY = "jigrify_gemini_key";
@@ -21,6 +31,13 @@ function parseEventData(raw) {
   } catch {
     return { message: raw };
   }
+}
+
+function createRunId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function createMessage(role, message, meta = null) {
@@ -35,7 +52,7 @@ function createMessage(role, message, meta = null) {
 
 export default function Builder({
   user,
-  activeProjectId,
+  projectId,
   projects,
   initialRequest,
   onSetActiveProject,
@@ -46,10 +63,11 @@ export default function Builder({
 }) {
   const [projectName, setProjectName] = useState("Untitled");
   const [prompt, setPrompt] = useState("");
+  const [draftPrompt, setDraftPrompt] = useState("");
   const [provider, setProvider] = useState("openai");
   const [forceMode, setForceMode] = useState("auto");
   const [chatMessages, setChatMessages] = useState([]);
-  const [chatInput, setChatInput] = useState("");
+  const [runs, setRuns] = useState([]);
   const [specHistory, setSpecHistory] = useState([]);
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [currentSpec, setCurrentSpec] = useState(null);
@@ -59,14 +77,19 @@ export default function Builder({
   const [lastStatus, setLastStatus] = useState("");
   const [lastError, setLastError] = useState("");
   const [retryCount, setRetryCount] = useState(0);
-  const [activeLeftTab, setActiveLeftTab] = useState("history");
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState("");
+  const [isTimelineOpen, setIsTimelineOpen] = useState(false);
   const [openAiKeyInput, setOpenAiKeyInput] = useState(localStorage.getItem(OPENAI_KEY) || "");
   const [geminiKeyInput, setGeminiKeyInput] = useState(localStorage.getItem(GEMINI_KEY) || "");
   const [settingsMessage, setSettingsMessage] = useState("");
   const [logs, setLogs] = useState([]);
+  const [agentEvents, setAgentEvents] = useState([]);
+  const [lastBuildError, setLastBuildError] = useState("");
 
   const [gameState, setGameState] = useState("idle");
   const [countdown, setCountdown] = useState(null);
+  const [playSession, setPlaySession] = useState(0);
+  const [playHighlight, setPlayHighlight] = useState(false);
   const [lastBuildPayload, setLastBuildPayload] = useState(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
   const [selectedRequiredModules, setSelectedRequiredModules] = useState([]);
@@ -74,21 +97,28 @@ export default function Builder({
   const [agentPlan, setAgentPlan] = useState(null);
   const [phaseTimeline, setPhaseTimeline] = useState([]);
   const [limitations, setLimitations] = useState([]);
+  const [pendingClarifyQuestion, setPendingClarifyQuestion] = useState(null);
+  const [clarifyAnswers, setClarifyAnswers] = useState({});
+  const [composerInput, setComposerInput] = useState("");
+  const [toastMessage, setToastMessage] = useState("");
+  const [buildPulse, setBuildPulse] = useState(false);
+  const [showAdvancedHistory, setShowAdvancedHistory] = useState(false);
 
-  const eventSourceRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const currentRunIdRef = useRef("");
+  const seenEventKeysRef = useRef(new Set());
   const buildInFlightRef = useRef(false);
   const reconnectTimerRef = useRef(null);
-  const messagesEndRef = useRef(null);
   const persistReadyRef = useRef(false);
+  const runOriginalPromptRef = useRef("");
+  const previousRunStateRef = useRef("stopped");
+  const pendingBuildHandledRef = useRef(new Set());
+  const startedRunIdsRef = useRef(new Set());
 
   const project = useMemo(
-    () => projects.find((entry) => entry.id === activeProjectId) || null,
-    [projects, activeProjectId],
+    () => projects.find((entry) => entry.id === projectId) || null,
+    [projects, projectId],
   );
-
-  const projectMessagesStorageKey = project?.id ? `aigb_project_${project.id}_messages` : "";
-  const projectSpecStorageKey = project?.id ? `aigb_project_${project.id}_spec` : "";
-
   const appendLog = (level, message, meta) => {
     setLogs((prev) => [
       {
@@ -107,11 +137,295 @@ export default function Builder({
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
     }
     buildInFlightRef.current = false;
+  };
+
+  const markEventSeen = (key) => {
+    if (!key) return false;
+    const seen = seenEventKeysRef.current;
+    if (seen.has(key)) return true;
+    seen.add(key);
+    if (seen.size > 300) {
+      const trimmed = Array.from(seen).slice(-250);
+      seenEventKeysRef.current = new Set(trimmed);
+    }
+    return false;
+  };
+
+  const parseSseChunk = (rawChunk) => {
+    const lines = String(rawChunk || "").split(/\r?\n/);
+    let event = "message";
+    const dataLines = [];
+
+    lines.forEach((line) => {
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+      }
+    });
+
+    return {
+      event,
+      data: parseEventData(dataLines.join("\n")),
+    };
+  };
+
+  const processStreamEvent = ({ event, payload, mode, runId, eventId }) => {
+    if (runId && Number.isFinite(eventId)) {
+      const dedupeKey = `${runId}|${eventId}`;
+      if (markEventSeen(dedupeKey)) return;
+    }
+
+    const eventType = event || "message";
+    setAgentEvents((prev) => [
+      {
+        id:
+          runId && Number.isFinite(eventId)
+            ? `${runId}|${eventId}`
+            : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        runId: runId || currentRunIdRef.current || "",
+        eventId: Number.isFinite(eventId) ? eventId : null,
+        type: eventType,
+        message:
+          payload?.message
+          || payload?.reason
+          || payload?.text
+          || payload?.step
+          || payload?.status
+          || "",
+        createdAt: new Date().toISOString(),
+      },
+      ...prev,
+    ].slice(0, 200));
+    console.log("Stream event", {
+      runId: runId || currentRunIdRef.current || "",
+      event: eventType,
+      eventId: Number.isFinite(eventId) ? eventId : undefined,
+    });
+
+    if (event === "clarify_question") {
+      if (!payload?.questionId || !payload?.text) return;
+      setPendingClarifyQuestion(payload);
+      setRunState("awaiting_clarify");
+      setLastStatus("clarify_waiting");
+      setPhaseTimeline((prev) => [...prev, {
+        phase: "clarify_question",
+        status: "waiting",
+        message: payload.text,
+        at: Date.now(),
+      }].slice(-40));
+      setChatMessages((prev) => [
+        ...prev,
+        createMessage("assistant", payload.text, { type: "clarify_question", choices: payload.choices || [] }),
+      ]);
+      appendLog("info", "Clarification required", payload);
+      return;
+    }
+
+    if (event === "plan") {
+      setAgentPlan(payload || null);
+      setLimitations(Array.isArray(payload?.willNotImplement) ? payload.willNotImplement : []);
+      setPhaseTimeline((prev) => [...prev, {
+        phase: "plan",
+        status: "done",
+        message: `Mode ${payload?.mode || "unknown"}`,
+        at: Date.now(),
+      }].slice(-40));
+      setChatMessages((prev) => [
+        ...prev,
+        createMessage(
+          "assistant",
+          `Plan: mode=${payload?.mode || "unknown"}; mechanics=${Array.isArray(payload?.mechanics) ? payload.mechanics.join(", ") : "n/a"}`,
+          { type: "plan", payload },
+        ),
+      ]);
+      appendLog("info", "Plan emitted", payload);
+      return;
+    }
+
+    if (event === "verify_pass") {
+      setLastStatus("verify_pass");
+      setPhaseTimeline((prev) => [...prev, {
+        phase: "verify_pass",
+        status: "done",
+        message: payload?.message || "Verification passed",
+        at: Date.now(),
+      }].slice(-40));
+      appendLog("info", payload?.message || "verify_pass", payload);
+      return;
+    }
+
+    if (event === "verify_fail") {
+      setLastStatus("verify_fail");
+      setPhaseTimeline((prev) => [...prev, {
+        phase: "verify_fail",
+        status: "failed",
+        message: Array.isArray(payload?.reasons) ? payload.reasons.join(" | ") : "Verification failed",
+        at: Date.now(),
+      }].slice(-40));
+      appendLog("warn", "verify_fail", payload);
+      return;
+    }
+
+    if (event === "repair_attempt") {
+      setLastStatus(`repair_attempt_${payload?.attempt || "?"}`);
+      setPhaseTimeline((prev) => [...prev, {
+        phase: "repair_attempt",
+        status: "running",
+        message: `Attempt ${payload?.attempt || "?"}`,
+        at: Date.now(),
+      }].slice(-40));
+      appendLog("info", `repair_attempt #${payload?.attempt || "?"}`, payload);
+      return;
+    }
+
+    if (event === "cannot_build") {
+      setRunState("ready");
+      setLastStatus("ready");
+      const message = payload?.reason || "Cannot build requested game honestly with current runtime.";
+      setLastError(message);
+      setLastBuildError(message);
+      setToastMessage(message);
+      setPendingClarifyQuestion(null);
+      setChatMessages((prev) => [
+        ...prev,
+        createMessage("assistant", `${message}${payload?.suggestion ? ` ${payload.suggestion}` : ""}`, { type: "cannot_build", payload }),
+      ]);
+      appendLog("warn", "cannot_build", payload);
+      closeStream();
+      return;
+    }
+
+    if (event === "done") {
+      const doneMessage = payload?.status === "ok" ? "" : (payload?.message || payload?.reason || "Build finished without a successful result.");
+      if (doneMessage) {
+        setLastError(doneMessage);
+        setLastBuildError(doneMessage);
+        setToastMessage(doneMessage);
+      }
+      setRunState("ready");
+      setLastStatus("ready");
+      setPendingClarifyQuestion(null);
+      appendLog("info", "done", payload);
+      closeStream();
+      return;
+    }
+
+    if (event === "status") {
+      if (payload?.step === "ping") return;
+      setLastStatus(payload?.step || "status");
+      appendLog("info", payload?.message || "Status update", payload);
+      return;
+    }
+
+    if (event === "phase_update") {
+      const phase = payload?.phase || "unknown";
+      const status = payload?.status || "running";
+      setLastStatus(`${phase}:${status}`);
+
+      setPhaseTimeline((prev) => {
+        const next = [...prev, { phase, status, message: payload?.message || "", at: Date.now() }];
+        return next.slice(-40);
+      });
+
+      if (payload?.plan) {
+        setAgentPlan(payload.plan);
+        setLimitations(Array.isArray(payload.plan.limitations) ? payload.plan.limitations : []);
+      }
+
+      if (Array.isArray(payload?.limitations)) {
+        setLimitations(payload.limitations);
+      }
+
+      appendLog("info", `Phase ${phase} ${status}`, payload);
+      return;
+    }
+
+    if (event === "chat_message") {
+      if (!payload?.message) return;
+      setChatMessages((prev) => [...prev, createMessage(payload.role || "assistant", payload.message, payload.meta || null)]);
+
+      if (payload?.meta?.type === "plan" && payload?.meta?.plan) {
+        setAgentPlan(payload.meta.plan);
+        setLimitations(Array.isArray(payload.meta.plan.limitations) ? payload.meta.plan.limitations : []);
+      }
+
+      if (payload?.meta?.limitations && Array.isArray(payload.meta.limitations)) {
+        setLimitations(payload.meta.limitations);
+      }
+      return;
+    }
+
+    if (event === "template_selected") {
+      if (!payload?.templateId) return;
+      setSelectedTemplateId(payload.templateId);
+      setTemplateMeta({
+        templateId: payload.templateId,
+        requestedTemplateId: payload.requestedTemplateId,
+        modulesEnabled: Array.isArray(payload.modulesEnabled) ? payload.modulesEnabled : [],
+        limitationSummary: payload.limitationSummary || "",
+        upgradePath: Array.isArray(payload.upgradePath) ? payload.upgradePath : [],
+        fallbackApplied: Boolean(payload.fallbackApplied),
+      });
+      setSelectedRequiredModules(Array.isArray(payload.modulesEnabled) ? payload.modulesEnabled : []);
+      const selectedName = getTemplateById(payload.templateId)?.name || payload.templateId;
+      setToastMessage(`Template selected: ${selectedName}`);
+      setBuildPulse(true);
+      setTimeout(() => setBuildPulse(false), 900);
+      appendLog("info", `Template selected: ${payload.templateId}`, payload);
+      return;
+    }
+
+    if (event === "spec_update") {
+      if (!payload || typeof payload !== "object") return;
+      setCurrentSpec(payload);
+      appendLog("info", "Spec intermediate update", { templateId: payload?.templateId });
+      return;
+    }
+
+    if (event === "run_in_progress") {
+      setLastStatus("run_in_progress");
+      appendLog("info", payload?.message || "Run is already in progress", payload);
+      closeStream();
+      return;
+    }
+
+    if (event === "run_already_completed") {
+      setLastStatus("run_already_completed");
+      if (payload?.finalSpec) {
+        saveSpecVersion(payload.finalSpec);
+        setRunState("ready");
+      }
+      appendLog("info", payload?.message || "Run already completed", payload);
+      closeStream();
+      return;
+    }
+
+    if (event === "spec") {
+      saveSpecVersion(payload);
+      setRunState("ready");
+      setLastStatus("ready");
+      setPendingClarifyQuestion(null);
+      appendLog("info", mode === "patch" ? "Patch applied" : "Game generated");
+      closeStream();
+      return;
+    }
+
+    if (event === "build_error" || event === "error") {
+      const message = payload?.message || "Stream error";
+      setLastError(message);
+      setLastBuildError(message);
+      setToastMessage(message);
+      setRunState("ready");
+      setLastStatus("ready");
+      appendLog("error", message, payload);
+      closeStream();
+    }
   };
 
   const checkServerHealth = async () => {
@@ -150,60 +464,123 @@ export default function Builder({
     setSelectedTemplateId(project.templateId || "");
     setSelectedRequiredModules(Array.isArray(project.requiredModules) ? project.requiredModules : []);
 
-    let loadedMessages = Array.isArray(project.messages) ? project.messages : [];
+    const loadedMessages = Array.isArray(project.chat)
+      ? project.chat
+      : Array.isArray(project.messages)
+        ? project.messages
+        : [];
     let loadedHistory = Array.isArray(project.specHistory) ? project.specHistory : [];
-
-    try {
-      if (projectMessagesStorageKey) {
-        const rawMessages = localStorage.getItem(projectMessagesStorageKey);
-        const parsedMessages = rawMessages ? JSON.parse(rawMessages) : null;
-        if (Array.isArray(parsedMessages)) {
-          loadedMessages = parsedMessages;
-        }
-      }
-
-      if (projectSpecStorageKey) {
-        const rawSpec = localStorage.getItem(projectSpecStorageKey);
-        const parsedSpec = rawSpec ? JSON.parse(rawSpec) : null;
-        if (parsedSpec && typeof parsedSpec === "object" && !Array.isArray(parsedSpec)) {
-          loadedHistory = [parsedSpec];
-        }
-      }
-    } catch {
-      // Ignore project-scoped storage parse errors.
-    }
 
     const loadedCursor = Number.isInteger(project.specCursor) ? project.specCursor : loadedHistory.length - 1;
 
     setChatMessages(loadedMessages);
+    setRuns(Array.isArray(project.runs) ? project.runs : []);
     setSpecHistory(loadedHistory);
     setHistoryCursor(loadedCursor);
     setCurrentSpec(loadedCursor >= 0 ? loadedHistory[loadedCursor] || null : null);
-    setPrompt("");
+    setPrompt(project.lastPrompt || "");
+    setDraftPrompt(project.draftPrompt || "");
     setLastStatus("");
     setLastError("");
+    setLastBuildError("");
     setRetryCount(0);
     setRunState("stopped");
     setTemplateMeta(null);
     setAgentPlan(null);
     setPhaseTimeline([]);
     setLimitations([]);
+    setPendingClarifyQuestion(null);
+    setClarifyAnswers({});
+    setAgentEvents([]);
+    runOriginalPromptRef.current = "";
+
+    if (loadedHistory.length === 0 && project.templateId) {
+      const template = getTemplateById(project.templateId);
+      if (template) {
+        const seeded = applyTemplateToSpec(template.defaultSpec, {
+          template,
+          intent: template.mode,
+          genre: template.genre || "generic",
+          requestedTemplateId: template.id,
+          templateId: template.id,
+          modulesEnabled: Array.isArray(project.requiredModules) && project.requiredModules.length > 0
+            ? project.requiredModules
+            : template.requiredModules || [],
+          isFallback: false,
+          unsupportedFeatures: [],
+          limitationSummary: "",
+          upgradePath: [],
+        });
+        loadedHistory = [seeded];
+      }
+    }
 
     persistReadyRef.current = true;
   }, [project?.id]);
 
   useEffect(() => {
+    if (!project || !project.pendingBuild) return;
+    if (buildInFlightRef.current) return;
+
+    const pending = project.pendingBuild;
+    const pendingKey = `${project.id}:${pending.runId || pending.createdAt || pending.prompt}`;
+    if (pendingBuildHandledRef.current.has(pendingKey)) {
+      return;
+    }
+
+    pendingBuildHandledRef.current.add(pendingKey);
+    setPrompt(pending.prompt || "");
+    setProvider(pending.provider || project.provider || "openai");
+    setForceMode(pending.mode || project.forceMode || "auto");
+    setSelectedTemplateId(pending.templateId || project.templateId || "");
+    setSelectedRequiredModules(
+      Array.isArray(pending.modules)
+        ? pending.modules
+        : Array.isArray(project.requiredModules)
+          ? project.requiredModules
+          : [],
+    );
+    setIsTimelineOpen(true);
+
+    void startBuild({
+      messageValue: pending.prompt || "",
+      providerValue: pending.provider || project.provider || "openai",
+      forceModeValue: pending.mode || project.forceMode || "auto",
+      templateIdValue: pending.templateId || project.templateId || "",
+      requiredModulesValue: Array.isArray(pending.modules)
+        ? pending.modules
+        : Array.isArray(project.requiredModules)
+          ? project.requiredModules
+          : [],
+      buildType: "generate",
+      retries: 0,
+      runIdValue: pending.runId || "",
+      originalPromptValue: pending.prompt || "",
+    });
+
+    upsertProject({
+      ...project,
+      pendingBuild: null,
+    });
+    onProjectsChanged?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.id, project?.pendingBuild?.runId, project?.pendingBuild?.createdAt, project?.pendingBuild?.prompt]);
+
+  useEffect(() => {
     if (!project || !persistReadyRef.current) return;
     upsertProject({
       ...project,
-      name: projectName || "Untitled",
+      title: projectName || "Untitled",
       provider,
-      forceMode,
+      mode: forceMode,
       templateId: selectedTemplateId,
-      requiredModules: selectedRequiredModules,
-      messages: chatMessages,
+      modules: selectedRequiredModules,
+      chat: chatMessages,
+      runs,
       specHistory,
       specCursor: historyCursor,
+      draftPrompt,
+      lastPrompt: prompt,
     });
     onProjectsChanged?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -214,29 +591,41 @@ export default function Builder({
     selectedTemplateId,
     selectedRequiredModules,
     chatMessages,
+    runs,
     specHistory,
     historyCursor,
+    draftPrompt,
+    prompt,
     project?.id,
   ]);
 
   useEffect(() => {
-    if (!projectMessagesStorageKey) return;
-    localStorage.setItem(projectMessagesStorageKey, JSON.stringify(chatMessages));
-  }, [projectMessagesStorageKey, chatMessages]);
-
-  useEffect(() => {
-    if (!projectSpecStorageKey) return;
-    localStorage.setItem(projectSpecStorageKey, JSON.stringify(currentSpec || null));
-  }, [projectSpecStorageKey, currentSpec]);
-
-  useEffect(() => {
-    if (!messagesEndRef.current) return;
-    messagesEndRef.current.scrollTop = messagesEndRef.current.scrollHeight;
-  }, [chatMessages]);
-
-  useEffect(() => {
     return () => closeStream();
   }, []);
+
+  useEffect(() => {
+    if (runState === "running" || runState === "awaiting_clarify" || lastStatus === "reconnecting") {
+      setIsTimelineOpen(true);
+    }
+
+    if (runState === "ready" && previousRunStateRef.current !== "ready") {
+      setPlayHighlight(true);
+      const timer = setTimeout(() => setPlayHighlight(false), 1800);
+      previousRunStateRef.current = runState;
+      return () => clearTimeout(timer);
+    }
+
+    previousRunStateRef.current = runState;
+    return undefined;
+  }, [runState, lastStatus]);
+
+  useEffect(() => {
+    if (runState === "ready") {
+      const timer = setTimeout(() => setIsTimelineOpen(false), 1200);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [runState]);
 
   useEffect(() => {
     if (!initialRequest?.id || !project) return;
@@ -296,22 +685,53 @@ export default function Builder({
     requiredModulesValue = selectedRequiredModules,
     buildType = "generate",
     retries = 0,
+    runIdValue = "",
+    answersValue = {},
+    originalPromptValue = "",
   }) => {
     const cleanMessage = String(messageValue || "").trim();
-    if (!cleanMessage || !project) return;
-    if (buildInFlightRef.current && retries === 0) return;
+    if (!project) {
+      if (projectId) return;
+      const message = "Open or create a project before building.";
+      setLastBuildError(message);
+      setLastError(message);
+      setToastMessage(message);
+      return;
+    }
+
+    if (!cleanMessage) {
+      const message = "Enter a prompt to build.";
+      setLastBuildError(message);
+      setLastError(message);
+      setToastMessage(message);
+      return;
+    }
+
+    if (buildInFlightRef.current && retries === 0) {
+      const message = "A build is already running.";
+      setLastBuildError(message);
+      setLastError(message);
+      setToastMessage(message);
+      return;
+    }
 
     const healthOk = await checkServerHealth();
     if (!healthOk) {
-      setLastError("Server is offline.");
-      appendLog("error", "Server is offline.");
+      const message = "Server unreachable.";
+      setLastError(message);
+      setLastBuildError(message);
+      setToastMessage(message);
+      appendLog("error", message);
       return;
     }
 
     const key = getApiKey(providerValue);
     if (!key) {
-      setLastError("Add your API key in Jigrify Settings.");
-      setActiveLeftTab("settings");
+      const message = "Add API key in Settings to build.";
+      setLastError(message);
+      setLastBuildError(message);
+      setToastMessage(message);
+      setActiveWorkspaceTab("settings");
       return;
     }
 
@@ -336,9 +756,38 @@ export default function Builder({
     );
 
     closeStream();
+    const runId = runIdValue || currentRunIdRef.current || createRunId();
+    if (runIdValue && retries === 0 && Object.keys(answersValue || {}).length === 0) {
+      if (startedRunIdsRef.current.has(runIdValue)) {
+        appendLog("info", "Skipped duplicate run trigger", { runId: runIdValue });
+        return;
+      }
+      startedRunIdsRef.current.add(runIdValue);
+    }
+    currentRunIdRef.current = runId;
+    if (!runOriginalPromptRef.current || (!runIdValue && retries === 0)) {
+      runOriginalPromptRef.current = originalPromptValue || cleanMessage;
+    }
+    if (retries === 0 && !runIdValue) {
+      seenEventKeysRef.current = new Set();
+      setRuns((prev) => {
+        if (prev.some((entry) => entry.id === runId)) return prev;
+        return [
+          ...prev,
+          {
+            id: runId,
+            createdAt: new Date().toISOString(),
+            buildType,
+            prompt: cleanMessage,
+            templateId: localSelection.templateId,
+          },
+        ].slice(-80);
+      });
+    }
     buildInFlightRef.current = true;
     setRunState("running");
     setLastError("");
+    setLastBuildError("");
     setLastStatus(retries > 0 ? "reconnecting" : "connecting");
     setRetryCount(retries);
     setLastBuildPayload({
@@ -353,152 +802,169 @@ export default function Builder({
       buildType,
     });
 
-    setChatMessages((prev) => [...prev, createMessage("user", cleanMessage, { buildType })]);
+    if (retries === 0 && Object.keys(answersValue || {}).length === 0) {
+      setChatMessages((prev) => [...prev, createMessage("user", cleanMessage, { buildType })]);
+    }
     appendLog("info", retries > 0 ? "Reconnecting build stream" : "Starting build", { buildType, retries });
 
     const mode = buildType === "refine" && currentSpec ? "patch" : "generate";
-    setPhaseTimeline([]);
+    if (Object.keys(answersValue || {}).length === 0) {
+      setPhaseTimeline([]);
+    }
 
-    const params = new URLSearchParams({
-      provider: providerValue,
-      apiKey: key,
-      projectId: project.id,
-      sessionId: project.id,
-      userPrompt: cleanMessage,
-      templateId: localSelection.templateId,
-      requiredModules: JSON.stringify(
-        Array.isArray(requiredModulesValue) && requiredModulesValue.length > 0
-          ? requiredModulesValue
-          : localSelection.modulesEnabled,
-      ),
-      currentSpec: mode === "patch" && currentSpec ? JSON.stringify(currentSpec) : "",
-    });
+    try {
+      let streamProducedSpec = false;
+      let streamCannotBuild = false;
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
 
-    const source = new EventSource(`${AGENT_STREAM_URL}?${params.toString()}`);
-    eventSourceRef.current = source;
+      const response = await fetch(AGENT_STREAM_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key}`,
+          "X-Model-Provider": providerValue,
+          "X-Retry-Attempt": String(retries),
+        },
+        body: JSON.stringify({
+          projectId: project.id,
+          runId,
+          prompt: originalPromptValue || runOriginalPromptRef.current || cleanMessage,
+          answers: answersValue,
+          templateId: localSelection.templateId,
+          mode,
+          modules:
+            Array.isArray(requiredModulesValue) && requiredModulesValue.length > 0
+              ? requiredModulesValue
+              : localSelection.modulesEnabled,
+          specCursor: historyCursor,
+          clientInfo: {
+            source: "builder",
+          },
+        }),
+        signal: controller.signal,
+      });
 
-    source.onopen = () => {
+      if (!response.ok || !response.body) {
+        throw new Error(`Stream request failed (${response.status}).`);
+      }
+
       setLastStatus("stream_open");
       appendLog("info", "Connected to build stream");
-    };
 
-    source.addEventListener("status", (event) => {
-      const payload = parseEventData(event.data);
-      if (payload?.step === "ping") return;
-      setLastStatus(payload?.step || "status");
-      appendLog("info", payload?.message || "Status update", payload);
-    });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-    source.addEventListener("phase_update", (event) => {
-      const payload = parseEventData(event.data);
-      const phase = payload?.phase || "unknown";
-      const status = payload?.status || "running";
-      setLastStatus(`${phase}:${status}`);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-      setPhaseTimeline((prev) => {
-        const next = [...prev, { phase, status, message: payload?.message || "", at: Date.now() }];
-        return next.slice(-40);
-      });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
 
-      if (payload?.plan) {
-        setAgentPlan(payload.plan);
-        setLimitations(Array.isArray(payload.plan.limitations) ? payload.plan.limitations : []);
+        chunks.forEach((chunk) => {
+          if (!chunk.trim()) return;
+          const parsed = parseSseChunk(chunk);
+          const envelope = parsed.data && typeof parsed.data === "object" ? parsed.data : {};
+          const eventType = envelope.type || parsed.event;
+          if (eventType === "spec" || eventType === "run_already_completed") {
+            streamProducedSpec = true;
+          }
+          if (eventType === "cannot_build") {
+            streamCannotBuild = true;
+          }
+          processStreamEvent({
+            event: eventType,
+            payload: envelope.payload ?? parsed.data,
+            mode,
+            runId: envelope.runId,
+            eventId: Number(envelope.eventId),
+          });
+        });
       }
 
-      if (Array.isArray(payload?.limitations)) {
-        setLimitations(payload.limitations);
+      if (buffer.trim()) {
+        const parsed = parseSseChunk(buffer);
+        const envelope = parsed.data && typeof parsed.data === "object" ? parsed.data : {};
+        const eventType = envelope.type || parsed.event;
+        if (eventType === "spec" || eventType === "run_already_completed") {
+          streamProducedSpec = true;
+        }
+        if (eventType === "cannot_build") {
+          streamCannotBuild = true;
+        }
+        processStreamEvent({
+          event: eventType,
+          payload: envelope.payload ?? parsed.data,
+          mode,
+          runId: envelope.runId,
+          eventId: Number(envelope.eventId),
+        });
       }
 
-      appendLog("info", `Phase ${phase} ${status}`, payload);
-    });
-
-    source.addEventListener("chat_message", (event) => {
-      const payload = parseEventData(event.data);
-      if (!payload?.message) return;
-      setChatMessages((prev) => [...prev, createMessage(payload.role || "assistant", payload.message, payload.meta || null)]);
-
-      if (payload?.meta?.type === "plan" && payload?.meta?.plan) {
-        setAgentPlan(payload.meta.plan);
-        setLimitations(Array.isArray(payload.meta.plan.limitations) ? payload.meta.plan.limitations : []);
-      }
-
-      if (payload?.meta?.limitations && Array.isArray(payload.meta.limitations)) {
-        setLimitations(payload.meta.limitations);
-      }
-    });
-
-    source.addEventListener("template_selected", (event) => {
-      const payload = parseEventData(event.data);
-      if (!payload?.templateId) return;
-
-      setSelectedTemplateId(payload.templateId);
-      setTemplateMeta({
-        templateId: payload.templateId,
-        requestedTemplateId: payload.requestedTemplateId,
-        modulesEnabled: Array.isArray(payload.modulesEnabled) ? payload.modulesEnabled : [],
-        limitationSummary: payload.limitationSummary || "",
-        upgradePath: Array.isArray(payload.upgradePath) ? payload.upgradePath : [],
-        fallbackApplied: Boolean(payload.fallbackApplied),
-      });
-      setSelectedRequiredModules(Array.isArray(payload.modulesEnabled) ? payload.modulesEnabled : []);
-      appendLog("info", `Template selected: ${payload.templateId}`, payload);
-    });
-
-    source.addEventListener("spec", (event) => {
-      const payload = parseEventData(event.data);
-      saveSpecVersion(payload);
-      setRunState("ready");
-      setLastStatus("ready");
-      appendLog("info", mode === "patch" ? "Patch applied" : "Game generated");
       closeStream();
-    });
+      if (!streamProducedSpec && !streamCannotBuild) {
+        const message = "Build ended without a usable result.";
+        setLastError(message);
+        setLastBuildError(message);
+        setToastMessage(message);
+        setRunState("ready");
+        setLastStatus("ready");
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        return;
+      }
 
-    source.addEventListener("spec_update", (event) => {
-      const payload = parseEventData(event.data);
-      if (!payload || typeof payload !== "object") return;
-      setCurrentSpec(payload);
-      appendLog("info", "Spec intermediate update", { templateId: payload?.templateId });
-    });
-
-    source.addEventListener("build_error", (event) => {
-      const payload = parseEventData(event.data);
-      const message = payload?.message || "Stream error";
-      setLastError(message);
-      setRunState("error");
-      setLastStatus("error");
-      appendLog("error", message, payload);
-      closeStream();
-    });
-
-    source.onerror = () => {
-      if (!eventSourceRef.current) return;
       closeStream();
 
-      if (retries < 2) {
+      if (/^Stream request failed \(\d+\)\.$/.test(String(error?.message || ""))) {
+        const message = String(error.message || "Build failed.");
+        setLastError(message);
+        setLastBuildError(message);
+        setToastMessage(message);
+        setRunState("ready");
+        setLastStatus("ready");
+        appendLog("error", message);
+        return;
+      }
+
+      if (retries < 3) {
+        const backoffMs = Math.min(9000, 1200 * 2 ** retries);
         setLastStatus("reconnecting");
-        setLastError("Reconnecting…");
+        setLastError(`Reconnecting… attempt ${retries + 1}`);
         reconnectTimerRef.current = setTimeout(() => {
           void startBuild({
             messageValue: cleanMessage,
             providerValue,
             forceModeValue,
+            templateIdValue,
+            requiredModulesValue,
             buildType,
             retries: retries + 1,
+            runIdValue: runId,
           });
-        }, 1200);
+        }, backoffMs);
         return;
       }
 
-      setLastError("Connection dropped while streaming.");
-      setRunState("error");
-      setLastStatus("error");
-      appendLog("error", "Connection dropped while streaming.");
-    };
+      const message = /failed|NetworkError|fetch/i.test(String(error?.message || ""))
+        ? "Server unreachable."
+        : "Connection dropped while streaming.";
+      setLastError(message);
+      setLastBuildError(message);
+      setToastMessage(message);
+      setRunState("ready");
+      setLastStatus("ready");
+      appendLog("error", message);
+    }
   };
 
   const handleRetry = () => {
     if (!lastBuildPayload) return;
-    void startBuild({ ...lastBuildPayload, retries: 0 });
+    void startBuild({ ...lastBuildPayload, retries: 1, runIdValue: currentRunIdRef.current });
   };
 
   const handleSaveSettings = () => {
@@ -520,10 +986,12 @@ export default function Builder({
       try {
         const response = await fetch(GENERATE_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${key}`,
+            "X-Model-Provider": provider,
+          },
           body: JSON.stringify({
-            provider,
-            apiKey: key,
             message: "test: make a ball on ground",
             mode: "generate",
             forceMode,
@@ -552,343 +1020,336 @@ export default function Builder({
     setCurrentSpec(specHistory[nextCursor] || null);
   };
 
-  const sceneTitle = currentSpec?.title || "None";
+  const sceneTitle = currentSpec?.title || "Untitled game";
   const isBoardMode = currentSpec?.mode === "board2d";
   const hudTimer = typeof countdown === "number" ? Math.max(0, Math.ceil(countdown)) : null;
   const resolvedTemplate = getTemplateById(currentSpec?.templateId || selectedTemplateId);
-  const resolvedTemplateMode = resolvedTemplate?.mode || currentSpec?.mode || forceMode;
   const resolvedModules =
     Array.isArray(currentSpec?.modules) && currentSpec.modules.length > 0
       ? currentSpec.modules
       : Array.isArray(selectedRequiredModules)
         ? selectedRequiredModules
         : templateMeta?.modulesEnabled || [];
-  const upgradeItems = Array.isArray(currentSpec?.upgradePath?.nextFeatures)
-    ? currentSpec.upgradePath.nextFeatures
-    : templateMeta?.upgradePath || [];
-  const timelineLabels = phaseTimeline.map((entry) => {
-    const raw = String(entry.phase || "");
-    if (raw.startsWith("repair_")) {
-      return `Repair #${raw.split("_")[1] || "?"}`;
+  const sceneObjects = Array.isArray(currentSpec?.scene?.objects) ? currentSpec.scene.objects : [];
+  const isBuilding = runState === "running" || lastStatus === "reconnecting";
+  const canPlay = Boolean(currentSpec) && runState === "ready";
+  const showEmptyPreview = !isBoardMode && sceneObjects.length === 0;
+  const hasFriendlyError = runState === "error" && Boolean(lastError);
+  const pendingChoices = Array.isArray(pendingClarifyQuestion?.choices) ? pendingClarifyQuestion.choices : [];
+  const statusLabel =
+    runState === "running"
+      ? "Building"
+      : runState === "awaiting_clarify"
+        ? "Needs input"
+        : runState === "error"
+          ? "Error"
+          : "Ready";
+  const statusVariant = runState === "error" ? "danger" : isBuilding ? "brand" : "success";
+
+  const hasPhase = (value) => phaseTimeline.some((entry) => String(entry.phase || "").includes(value));
+  const timelineCards = [
+    {
+      id: "clarify",
+      label: "Clarify",
+      description: pendingClarifyQuestion?.text || "Captures missing details before generation.",
+      state: pendingClarifyQuestion ? "active" : hasPhase("clarify") ? "done" : "idle",
+    },
+    {
+      id: "plan",
+      label: "Plan",
+      description: agentPlan?.mvpDefinition || "Build strategy is prepared here.",
+      state: hasPhase("plan") ? "done" : isBuilding ? "active" : "idle",
+    },
+    {
+      id: "verify",
+      label: "Verify",
+      description: hasPhase("verify_fail") ? "Checks found issues that need fixing." : "Agent validates interactions and rules.",
+      state: hasPhase("verify_fail") ? "error" : hasPhase("verify_pass") ? "done" : hasPhase("verify") ? "active" : "idle",
+    },
+    {
+      id: "repair",
+      label: "Repair",
+      description: hasPhase("repair") ? "Auto-fixing edge cases and runtime safety." : "No repairs needed yet.",
+      state: hasPhase("repair") ? (runState === "ready" ? "done" : "active") : "idle",
+    },
+    {
+      id: "done",
+      label: "Done",
+      description: runState === "ready" ? "Build completed. Play is now unlocked." : "Final output appears here.",
+      state: runState === "ready" ? "done" : runState === "error" ? "error" : "idle",
+    },
+  ];
+
+  const completedTimelineCards = timelineCards.filter((card) => card.state === "done").length;
+  const progressPercent = Math.round((completedTimelineCards / timelineCards.length) * 100);
+
+  const renderStatusText = (state) => {
+    if (state === "done") return "Done";
+    if (state === "active") return "Working";
+    if (state === "error") return "Failed";
+    return "Pending";
+  };
+
+  const renderStatusVariant = (state) => {
+    if (state === "done") return "success";
+    if (state === "active") return "brand";
+    if (state === "error") return "danger";
+    return "muted";
+  };
+
+  const renderTimelineIcon = (state) => {
+    if (state === "done") return "✓";
+    if (state === "active") return "●";
+    if (state === "error") return "!";
+    return "○";
+  };
+
+  const handleComposerSubmit = () => {
+    const nextMessage = composerInput.trim();
+    if (!nextMessage) {
+      const message = "Type a message before sending.";
+      setLastBuildError(message);
+      setLastError(message);
+      setToastMessage(message);
+      return;
     }
-    return raw.charAt(0).toUpperCase() + raw.slice(1);
-  });
+
+    if (pendingClarifyQuestion?.questionId) {
+      const qid = pendingClarifyQuestion.questionId;
+      const nextAnswers = {
+        ...clarifyAnswers,
+        [qid]: nextMessage,
+      };
+      setClarifyAnswers(nextAnswers);
+      setChatMessages((prev) => [...prev, createMessage("user", nextMessage, { type: "clarify_answer", questionId: qid })]);
+      setComposerInput("");
+      setPendingClarifyQuestion(null);
+      setIsTimelineOpen(true);
+      void startBuild({
+        messageValue: runOriginalPromptRef.current || prompt,
+        buildType: "generate",
+        runIdValue: currentRunIdRef.current,
+        answersValue: nextAnswers,
+        originalPromptValue: runOriginalPromptRef.current || prompt,
+      });
+      return;
+    }
+
+    setComposerInput("");
+    setPrompt(nextMessage);
+    setIsTimelineOpen(true);
+    void startBuild({ messageValue: nextMessage, buildType: currentSpec ? "refine" : "generate" });
+  };
 
   return (
     <div className="builder2-shell">
-      <header className="builder2-topbar">
-        <div className="left-actions">
-          <button type="button" className="ghost-btn" onClick={onBack}>
-            ← Back
-          </button>
-          <span className="status-chip online">Jigrify Builder</span>
-          <span className="status-chip online">Template: {resolvedTemplate?.name || selectedTemplateId || "Auto"}</span>
-          <span className="status-chip online">Mode: {resolvedTemplateMode || "auto"}</span>
-          <span className="status-chip online">Modules: {resolvedModules.join(", ") || "none"}</span>
-          <input
-            className="project-input"
-            value={projectName}
-            onChange={(event) => setProjectName(event.target.value)}
-            aria-label="Project name"
-          />
-        </div>
+      <div className="builder2-layout">
+        <aside className="builder2-sidebar" aria-label="Workspace navigation">
+          <IconButton onClick={onBack} title="Back to landing" aria-label="Back to landing">
+            ←
+          </IconButton>
+          <IconButton
+            active={activeWorkspaceTab === "projects"}
+            onClick={() => setActiveWorkspaceTab((prev) => (prev === "projects" ? "" : "projects"))}
+            title="Projects"
+            aria-label="Projects"
+          >
+            📁
+          </IconButton>
+          <IconButton
+            active={activeWorkspaceTab === "history"}
+            onClick={() => setActiveWorkspaceTab((prev) => (prev === "history" ? "" : "history"))}
+            title="History"
+            aria-label="History"
+          >
+            🕘
+          </IconButton>
+          <IconButton
+            active={activeWorkspaceTab === "settings"}
+            onClick={() => setActiveWorkspaceTab((prev) => (prev === "settings" ? "" : "settings"))}
+            title="Settings"
+            aria-label="Settings"
+          >
+            ⚙
+          </IconButton>
+        </aside>
 
-        <div className="right-actions">
-          <span className={`status-chip ${serverOnline ? "online" : "offline"}`}>
-            Server {serverOnline ? "Online" : "Offline"}
-          </span>
-          <button
-            type="button"
-            className="primary-btn"
-            onClick={() =>
+        <main className="builder2-main">
+          <Card className="builder-main-topbar">
+            <CardBody className="builder-main-topbar-inner">
+              <div className="title-wrap">
+                <label htmlFor="builder-project-title">Game Title</label>
+                <Input
+                  id="builder-project-title"
+                  className="project-input"
+                  value={projectName}
+                  onChange={(event) => setProjectName(event.target.value)}
+                  aria-label="Game title"
+                />
+              </div>
+
+              <div className="builder-main-actions">
+                <BuildPanel
+                  runState={runState}
+                  prompt={prompt}
+                  setPrompt={setPrompt}
+                  draftPrompt={draftPrompt}
+                  composerInput={composerInput}
+                  onBuild={(seed) => {
+                    setPrompt(seed);
+                    if (seed === composerInput.trim()) {
+                      setComposerInput("");
+                    }
+                    setIsTimelineOpen(true);
+                    void startBuild({ messageValue: seed, buildType: currentSpec ? "refine" : "generate" });
+                  }}
+                  onStop={() => {
+                    closeStream();
+                    setRunState("stopped");
+                  }}
+                  lastBuildError={lastBuildError}
+                />
+
+                <div title={!canPlay ? "Build first to unlock Play" : "Play your latest scene"}>
+                  <Button
+                    variant="secondary"
+                    className={playHighlight ? "success-pulse" : ""}
+                    disabled={!canPlay}
+                    onClick={() => {
+                      if (!canPlay) return;
+                      setGameState("idle");
+                      setPlaySession((prev) => prev + 1);
+                    }}
+                  >
+                    Play
+                  </Button>
+                </div>
+
+                <div className="builder-indicators">
+                  <Badge variant={statusVariant}>{statusLabel}</Badge>
+                  <Badge variant={serverOnline ? "success" : "danger"}>
+                    {serverOnline ? "Server online" : "Server offline"}
+                  </Badge>
+                </div>
+              </div>
+            </CardBody>
+          </Card>
+
+          <WorkspaceDrawer
+            activeTab={activeWorkspaceTab}
+            projects={projects}
+            specHistory={specHistory}
+            historyCursor={historyCursor}
+            provider={provider}
+            forceMode={forceMode}
+            openAiKeyInput={openAiKeyInput}
+            geminiKeyInput={geminiKeyInput}
+            settingsMessage={settingsMessage}
+            showAdvancedHistory={showAdvancedHistory}
+            onCreateProject={() =>
               onCreateProject?.({
                 name: "Untitled",
                 provider,
                 forceMode,
                 templateId: selectedTemplateId,
-                requiredModules:
-                  Array.isArray(currentSpec?.modules) && currentSpec.modules.length > 0
-                    ? currentSpec.modules
-                    : selectedRequiredModules,
+                requiredModules: resolvedModules,
                 autoRun: false,
               })
             }
-          >
-            New Project
-          </button>
-          <button
-            type="button"
-            className="primary-btn"
-            onClick={() => {
-              if (runState === "running") {
-                closeStream();
-                setRunState("stopped");
+            onSetActiveProject={onSetActiveProject}
+            onDeleteProject={onDeleteProject}
+            onUndo={undoSpec}
+            onRedo={redoSpec}
+            onToggleAdvancedHistory={() => setShowAdvancedHistory((v) => !v)}
+            setProvider={setProvider}
+            setForceMode={setForceMode}
+            setOpenAiKeyInput={setOpenAiKeyInput}
+            setGeminiKeyInput={setGeminiKeyInput}
+            onSaveSettings={handleSaveSettings}
+            onTestKey={handleTestKey}
+            resolvedTemplate={resolvedTemplate}
+            resolvedModules={resolvedModules}
+          />
+
+          <PreviewStage
+            currentSpec={currentSpec}
+            runState={runState}
+            lastError={lastError}
+            lastBuildError={lastBuildError}
+            playSession={playSession}
+            gameState={gameState}
+            hudTimer={hudTimer}
+            sceneTitle={sceneTitle}
+            isBoardMode={isBoardMode}
+            showEmptyPreview={showEmptyPreview}
+            hasFriendlyError={hasFriendlyError}
+            isBuilding={isBuilding}
+            setGameState={setGameState}
+            setCountdown={setCountdown}
+            setPlaySession={setPlaySession}
+            onBuildTrigger={() => {
+              const seedPrompt = composerInput.trim() || prompt.trim() || draftPrompt.trim();
+              if (!seedPrompt) {
+                const message = "Enter a prompt to build.";
+                setLastBuildError(message);
+                setLastError(message);
+                setToastMessage(message);
                 return;
               }
-              void startBuild({ buildType: "generate" });
+              setPrompt(seedPrompt);
+              setIsTimelineOpen(true);
+              void startBuild({ messageValue: seedPrompt, buildType: currentSpec ? "refine" : "generate" });
             }}
-          >
-            {runState === "running" ? "Stop" : "Run"}
-          </button>
-        </div>
-      </header>
+          />
 
-      <div className="builder2-body">
-        <aside className="left-panel">
-          <div className="panel-card">
-            <h3>Brain Timeline</h3>
-            {timelineLabels.length === 0 ? (
-              <p className="settings-msg">Plan → Build → Verify → Repair → Ready</p>
-            ) : (
-              <ul className="steps-list">
-                {timelineLabels.map((label, index) => (
-                  <li
-                    key={`${label}-${index}`}
-                    className={index === timelineLabels.length - 1 ? "active" : "done"}
-                  >
-                    <span>{index + 1}</span>
-                    <p>{label}</p>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <Card className="builder-composer">
+            <CardBody>
+              <ClarifyCard
+                pendingClarifyQuestion={pendingClarifyQuestion}
+                clarifyAnswers={clarifyAnswers}
+                setClarifyAnswers={setClarifyAnswers}
+                setComposerInput={setComposerInput}
+              />
 
-          <div className="panel-card">
-            <h3>User</h3>
-            <p>{user?.name || "Guest"}</p>
-          </div>
-
-          <div className="panel-card">
-            <div className="left-tabs">
-              <button type="button" className={activeLeftTab === "history" ? "active" : ""} onClick={() => setActiveLeftTab("history")}>
-                History
-              </button>
-              <button type="button" className={activeLeftTab === "projects" ? "active" : ""} onClick={() => setActiveLeftTab("projects")}>
-                Projects
-              </button>
-              <button type="button" className={activeLeftTab === "settings" ? "active" : ""} onClick={() => setActiveLeftTab("settings")}>
-                Settings
-              </button>
-            </div>
-
-            {activeLeftTab === "history" ? (
-              <div className="history-box">
-                <p>Spec versions: {specHistory.length}</p>
-                <p>Cursor: {historyCursor + 1}</p>
-              </div>
-            ) : null}
-
-            {activeLeftTab === "projects" ? (
-              <div className="history-box">
-                <ul>
-                  {projects.slice(0, 10).map((entry) => (
-                    <li key={entry.id}>
-                      <strong>{entry.name || "Untitled"}</strong>
-                      <span>{new Date(entry.updatedAt).toLocaleString()}</span>
-                      <button type="button" onClick={() => onSetActiveProject?.(entry.id)}>
-                        Open
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (window.confirm(`Delete project \"${entry.name || "Untitled"}\"?`)) {
-                            onDeleteProject?.(entry.id);
-                          }
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            {activeLeftTab === "settings" ? (
-              <div className="settings-box">
-                <label htmlFor="builder-provider">Provider</label>
-                <select id="builder-provider" value={provider} onChange={(event) => setProvider(event.target.value)}>
-                  <option value="openai">OpenAI</option>
-                  <option value="gemini">Gemini</option>
-                </select>
-
-                <label htmlFor="builder-mode">Mode preference</label>
-                <select id="builder-mode" value={forceMode} onChange={(event) => setForceMode(event.target.value)}>
-                  <option value="auto">Auto</option>
-                  <option value="physics3d">3D Physics</option>
-                  <option value="board2d">Board Game</option>
-                </select>
-
-                <label htmlFor="builder-key">{provider === "gemini" ? "Gemini API key" : "OpenAI API key"}</label>
-                <input
-                  id="builder-key"
-                  type="password"
-                  value={provider === "gemini" ? geminiKeyInput : openAiKeyInput}
-                  onChange={(event) =>
-                    provider === "gemini" ? setGeminiKeyInput(event.target.value) : setOpenAiKeyInput(event.target.value)
-                  }
-                />
-
-                <div className="settings-actions">
-                  <button type="button" onClick={handleSaveSettings}>Save</button>
-                  <button type="button" onClick={handleTestKey}>Test Key</button>
-                </div>
-                {settingsMessage ? <p className="settings-msg">{settingsMessage}</p> : null}
-              </div>
-            ) : null}
-          </div>
-        </aside>
-
-        <section className="middle-panel">
-          <div className="prompt-run-row">
-            <input
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="Describe your game and click Run"
-            />
-            <button type="button" className="primary-btn" onClick={() => void startBuild({ buildType: "generate" })}>
-              Run New
-            </button>
-          </div>
-
-          <div className="spec-history-actions">
-            <button type="button" onClick={undoSpec} disabled={historyCursor <= 0}>Undo</button>
-            <button type="button" onClick={redoSpec} disabled={historyCursor >= specHistory.length - 1}>Redo</button>
-            <span>Version {historyCursor + 1}/{specHistory.length}</span>
-          </div>
-
-          <div className="errors-view">
-            <h4>Status</h4>
-            <p>{lastStatus || "idle"}</p>
-            <h4>Last error</h4>
-            <p>{lastError || "No errors"}</p>
-            {runState === "error" ? (
-              <button type="button" className="primary-btn" onClick={handleRetry}>
-                Retry Build
-              </button>
-            ) : null}
-          </div>
-
-          <div className="errors-view">
-            <h4>Template</h4>
-            <p>{resolvedTemplate?.name || currentSpec?.templateId || selectedTemplateId || "Auto"}</p>
-            <h4>Modules enabled</h4>
-            <p>{resolvedModules.join(", ") || "No modules yet"}</p>
-            {templateMeta?.limitationSummary ? (
-              <>
-                <h4>Capability note</h4>
-                <p>{templateMeta.limitationSummary}</p>
-              </>
-            ) : null}
-          </div>
-
-          <div className="upgrade-panel">
-            <h4>Upgrade Path</h4>
-            {upgradeItems.length > 0 ? (
-              <ul>
-                {upgradeItems.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            ) : (
-              <p>No upgrade suggestions yet. Generate a build to see next steps.</p>
-            )}
-          </div>
-
-          <div className="errors-view">
-            <h4>Agent Plan</h4>
-            <p>{agentPlan?.mvpDefinition || "Run a build to see the MVP plan."}</p>
-            {Array.isArray(agentPlan?.buildSteps) && agentPlan.buildSteps.length > 0 ? (
-              <ul>
-                {agentPlan.buildSteps.map((step) => (
-                  <li key={step}>{step}</li>
-                ))}
-              </ul>
-            ) : null}
-            <h4>Limitations</h4>
-            {limitations.length > 0 ? (
-              <ul>
-                {limitations.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            ) : (
-              <p>No known limitations for current MVP.</p>
-            )}
-          </div>
-
-          <div className="log-console">
-            <ul>
-              {logs.map((log) => (
-                <li key={log.id}>
-                  <span className={`lvl ${log.level}`}>{log.level.toUpperCase()}</span>
-                  <span>{new Date(log.createdAt).toLocaleTimeString()}</span>
-                  <p>{log.message}</p>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </section>
-
-        <section className="right-panel">
-          <div className="right-split">
-            <div className="preview-wrap">
-              {isBoardMode ? (
-                <Board2DView spec={currentSpec?.board2d} />
-              ) : (
-                <GameViewport gameSpec={currentSpec} onGameStateChange={setGameState} onCountdownChange={setCountdown} />
-              )}
-
-              <div className="preview-hud">
-                <p>Scene: {sceneTitle}</p>
-                <p>Mode: {isBoardMode ? "Board" : "Physics"}</p>
-                {hudTimer !== null ? <p>Time: {hudTimer}s</p> : null}
-              </div>
-
-              {gameState === "won" ? <div className="preview-result won">You win</div> : null}
-              {gameState === "lost" ? <div className="preview-result lost">You lost</div> : null}
-            </div>
-
-            <aside className="chat-panel">
-              <div className="chat-panel-header">
-                <h3>Ask follow-up / refine</h3>
-                <span>{currentSpec ? "Agent refine mode" : "Agent generate mode"}</span>
-              </div>
-
-              <div className="chat-messages" ref={messagesEndRef}>
-                {chatMessages.map((entry) => (
-                  <div key={entry.id} className={`chat-message ${entry.role}`}>
-                    <div className="chat-role">{entry.role === "user" ? "You" : "Builder"}</div>
-                    <p>{entry.message}</p>
-                  </div>
-                ))}
-              </div>
-
-              <div className="chat-input-row">
-                <textarea
-                  value={chatInput}
-                  onChange={(event) => setChatInput(event.target.value)}
-                  placeholder="Ask changes or follow-up goals (agent will re-plan with current spec)"
-                />
-                <button
-                  type="button"
-                  className="primary-btn"
-                  onClick={() => {
-                    const nextMessage = chatInput.trim();
-                    if (!nextMessage) return;
-                    setChatInput("");
-                    setPrompt(nextMessage);
-                    void startBuild({ messageValue: nextMessage, buildType: "refine" });
+              <div className="composer-row">
+                <Input
+                  value={composerInput}
+                  onChange={(event) => setComposerInput(event.target.value)}
+                  placeholder="Describe changes to your game…"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      handleComposerSubmit();
+                    }
                   }}
-                >
-                  Send
-                </button>
+                />
+                <Button type="button" onClick={handleComposerSubmit}>Send</Button>
               </div>
-            </aside>
-          </div>
-        </section>
+              <p className="composer-hint">Tip: ask for mechanics, rules, or visual changes in one line.</p>
+            </CardBody>
+          </Card>
+        </main>
+
+        <button
+          type="button"
+          className={`timeline-peek ${isTimelineOpen ? "open" : ""}`}
+          onClick={() => setIsTimelineOpen((prev) => !prev)}
+          aria-label={isTimelineOpen ? "Collapse timeline" : "Expand timeline"}
+        >
+          {isTimelineOpen ? "→" : "←"}
+        </button>
+
+        <TimelineDrawer
+          isOpen={isTimelineOpen}
+          onToggle={() => setIsTimelineOpen((prev) => !prev)}
+          phaseTimeline={phaseTimeline}
+          agentEvents={agentEvents}
+          runState={runState}
+          agentPlan={agentPlan}
+          pendingClarifyQuestion={pendingClarifyQuestion}
+        />
       </div>
+      <Toast open={Boolean(toastMessage)} message={toastMessage} onDone={() => setToastMessage("")} />
     </div>
   );
 }
